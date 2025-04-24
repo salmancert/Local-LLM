@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Linda Chatbot</title>
+    <style>
+        :root {
+            --primary-color: #2c6ecf;
+            --secondary-color: #f0f4f8;
+            --border-color: #d1d9e6;
+            --text-primary: #333;
+            --text-secondary: #666;
+            --assistant-bg: #eef5ff;
+            --user-bg: #f5f5f5;
+            --recording-color: #e74c3c;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #fff;
+            color: var(--text-primary);
+            line-height: 1.6;
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+        }
+
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        h2 {
+            margin: 0;
+            color: var(--primary-color);
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        #chat-container {
+            flex: 1;
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 15px;
+            height: 450px;
+            overflow-y: scroll;
+            margin-bottom: 20px;
+            background-color: white;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+        }
+
+        #control-bar {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            padding: 15px;
+            background-color: var(--secondary-color);
+            border-radius: 6px;
+            align-items: center;
+        }
+
+        .file-input-wrapper {
+            position: relative;
+            flex: 1;
+        }
+
+        .file-input-wrapper input[type="file"] {
+            opacity: 0;
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            cursor: pointer;
+        }
+
+        .file-input-label {
+            display: block;
+            padding: 10px 15px;
+            background-color: white;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            cursor: pointer;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        #input-area {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        #message-input {
+            flex: 1;
+            padding: 12px 15px;
+            font-size: 16px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            outline: none;
+            transition: border 0.3s ease;
+        }
+
+        #message-input:focus {
+            border-color: var(--primary-color);
+        }
+
+        button {
+            padding: 10px 18px;
+            font-size: 16px;
+            cursor: pointer;
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            transition: background-color 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        button:hover {
+            background-color: #1e5bb0;
+        }
+
+        button#record-btn {
+            background-color: #16a085;
+        }
+
+        button#record-btn.recording {
+            background-color: var(--recording-color);
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% {
+                opacity: 1;
+            }
+            50% {
+                opacity: 0.75;
+            }
+            100% {
+                opacity: 1;
+            }
+        }
+
+        .message {
+            padding: 12px 15px;
+            margin: 10px 0;
+            border-radius: 8px;
+            position: relative;
+            max-width: 80%;
+            word-wrap: break-word;
+        }
+
+        .user {
+            background-color: var(--user-bg);
+            margin-left: auto;
+            border-bottom-right-radius: 0;
+            text-align: right;
+        }
+
+        .bot {
+            background-color: var(--assistant-bg);
+            margin-right: auto;
+            border-bottom-left-radius: 0;
+            text-align: left;
+        }
+
+        .sender {
+            font-weight: bold;
+            margin-bottom: 4px;
+        }
+
+        .sender-user {
+            color: var(--primary-color);
+        }
+
+        .sender-assistant {
+            color: #256d3b;
+        }
+
+        .content {
+            white-space: pre-line; /* This preserves line breaks */
+        }
+
+        .content ul, .content ol {
+            text-align: left;
+            padding-left: 20px;
+            margin: 8px 0;
+        }
+
+        .content li {
+            margin-bottom: 4px;
+        }
+
+        .timestamp {
+            font-size: 11px;
+            color: var(--text-secondary);
+            text-align: right;
+            margin-top: 5px;
+        }
+
+        .status {
+            padding: 8px;
+            font-size: 14px;
+            text-align: center;
+            color: var(--text-secondary);
+            font-style: italic;
+        }
+
+        #typing-indicator {
+            padding: 8px;
+            font-size: 14px;
+            text-align: center;
+            color: var(--text-secondary);
+            font-style: italic;
+        }
+
+        #recording-status {
+            padding: 8px;
+            font-size: 14px;
+            color: var(--text-secondary);
+            margin-left: 10px;
+            flex-grow: 1;
+        }
+
+        #recording-status.active {
+            color: var(--recording-color);
+            font-weight: bold;
+        }
+
+        #upload-status {
+            margin-top: 5px;
+            font-size: 14px;
+            color: var(--primary-color);
+        }
+
+        /* New styles for audio toggle button */
+        #audio-toggle {
+            background-color: #7d3c98;
+            margin-left: 10px;
+        }
+        
+        #audio-toggle.muted {
+            background-color: #a9a9a9;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 10px;
+            }
+            
+            .message {
+                max-width: 90%;
+            }
+            
+            #control-bar {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h2>
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M20 2H4C2.9 2 2 2.9 2 4V22L6 18H20C21.1 18 22 17.1 22 16V4C22 2.9 21.1 2 20 2Z" fill="#2c6ecf"/>
+            </svg>
+            Chat with Linda
+        </h2>
+        <div id="user-display"></div>
+    </header>
+    <div id="chat-container">
+        <!-- Chat messages will be added here -->
+        <div id="typing-indicator" style="display: none;">Linda is typing...</div>
+    </div>
+    
+    <div id="control-bar">
+        <div class="file-input-wrapper">
+            <div class="file-input-label">Choose file to upload</div>
+            <input type="file" name="file" id="file-input" />
+        </div>
+        <button id="upload-button">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M11 15V3H13V15H16L12 19L8 15H11Z" fill="white"/>
+            </svg>
+            Upload
+        </button>
+        <button id="record-btn">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" fill="white"/>
+                <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" fill="white"/>
+            </svg>
+            Record
+        </button>
+        <button id="audio-toggle">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M3 9v6h4l5 5V4L7 9H3z" fill="white"/>
+                <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z" fill="white"/>
+                <path d="M14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" fill="white"/>
+            </svg>
+            Unmuted
+        </button>
+        <span id="recording-status"></span>
+    </div>
+    <div id="upload-status"></div>
+    <div id="input-area">
+        <input type="text" id="message-input" placeholder="Type your message here..." />
+        <button id="send-button">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M2.01 21L23 12L2.01 3L2 10L17 12L2 14L2.01 21Z" fill="white"/>
+            </svg>
+            Send
+        </button>
+    </div>
+    <script>
+        // Session management
+        let sessionId = localStorage.getItem("chat_session_id") || crypto.randomUUID();
+        localStorage.setItem("chat_session_id", sessionId);
+        
+        // Username handling
+        let username = localStorage.getItem("chat_username");
+        
+        // Audio settings
+        let audioMuted = localStorage.getItem("audio_muted") === "true" || false;
+        const audioToggleBtn = document.getElementById("audio-toggle");
+        
+        // Update audio toggle button state
+        function updateAudioToggleButton() {
+            if (audioMuted) {
+                audioToggleBtn.innerHTML = `
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63z" fill="white"/>
+                        <path d="M19 12c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71z" fill="white"/>
+                        <path d="M4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z" fill="white"/>
+                    </svg>
+                    Muted
+                `;
+                audioToggleBtn.classList.add("muted");
+            } else {
+                audioToggleBtn.innerHTML = `
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M3 9v6h4l5 5V4L7 9H3z" fill="white"/>
+                        <path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z" fill="white"/>
+                        <path d="M14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z" fill="white"/>
+                    </svg>
+                    Unmuted
+                `;
+                audioToggleBtn.classList.remove("muted");
+            }
+        }
+        
+        // Initialize audio toggle state
+        updateAudioToggleButton();
+
+        // Try to get username from environment first
+        fetch("/get_username")
+            .then(res => res.json())
+            .then(data => {
+                if (data.username) {
+                    username = data.username;
+                    localStorage.setItem("chat_username", username);
+                    document.getElementById("user-display").textContent = "Welcome, " + username;
+                } else if (!username) {
+                    // If no username from environment and not in localStorage, prompt
+                    username = prompt("Enter your name:", "User");
+                    localStorage.setItem("chat_username", username);
+                    document.getElementById("user-display").textContent = "Welcome, " + username;
+                }
+            })
+            .catch(err => {
+                console.error("Could not fetch username:", err);
+                // Fallback if fetch fails
+                if (!username) {
+                    username = prompt("Enter your name:", "User");
+                    localStorage.setItem("chat_username", username);
+                }
+                document.getElementById("user-display").textContent = "Welcome, " + username;
+            });
+
+        // Update file input label when file is selected
+        document.getElementById("file-input").addEventListener("change", function() {
+            const fileName = this.files[0]?.name || "Choose file to upload";
+            this.previousElementSibling.textContent = fileName;
+        });
+
+        function formatTime() {
+            const now = new Date();
+            return now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+
+        // Helper function to detect and parse markdown-like lists in text
+        function formatMessageText(text) {
+            // Handle bullet points (lines starting with *, -, or •)
+            let formattedText = text.replace(/^([*\-•])[ \t]+(.+)$/gm, '<li>$2</li>');
+            
+            // Handle numbered lists (lines starting with 1., 2., etc)
+            formattedText = formattedText.replace(/^(\d+\.)[ \t]+(.+)$/gm, '<li>$2</li>');
+            
+            // Wrap any sequences of <li> elements with <ul> or <ol>
+            let inList = false;
+            let lines = formattedText.split('\n');
+            let result = [];
+            
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].startsWith('<li>')) {
+                    if (!inList) {
+                        // Check if it's a numbered list
+                        if (/^\d+\./.test(lines[i])) {
+                            result.push('<ol>');
+                        } else {
+                            result.push('<ul>');
+                        }
+                        inList = true;
+                    }
+                    result.push(lines[i]);
+                } else {
+                    if (inList) {
+                        // End the list if the next line is not a list item
+                        if (/^\d+\./.test(lines[i-1])) {
+                            result.push('</ol>');
+                        } else {
+                            result.push('</ul>');
+                        }
+                        inList = false;
+                    }
+                    result.push(lines[i]);
+                }
+            }
+            
+            // Close any open list at the end
+            if (inList) {
+                if (/^\d+\./.test(lines[lines.length-1])) {
+                    result.push('</ol>');
+                } else {
+                    result.push('</ul>');
+                }
+            }
+            
+            return result.join('\n');
+        }
+
+        function addMessage(sender, text, isUser = false) {
+            // Add message before the typing indicator
+            const typingIndicator = document.getElementById("typing-indicator");
+            
+            const messageContainer = document.createElement("div");
+            messageContainer.className = "message " + (isUser ? "user" : "bot");
+            
+            const senderElement = document.createElement("div");
+            senderElement.className = "sender " + (isUser ? "sender-user" : "sender-assistant");
+            senderElement.textContent = sender;
+            messageContainer.appendChild(senderElement);
+            
+            const msgContent = document.createElement("div");
+            msgContent.className = "content";
+            
+            // For assistant messages, try to detect and format lists
+            if (!isUser) {
+                // Check if message appears to contain a list
+                if (/^[*\-•][ \t]+|\d+\.[ \t]+/m.test(text)) {
+                    msgContent.innerHTML = formatMessageText(text);
+                } else {
+                    msgContent.textContent = text;
+                }
+            } else {
+                msgContent.textContent = text;
+            }
+            
+            messageContainer.appendChild(msgContent);
+            
+            const timestamp = document.createElement("div");
+            timestamp.className = "timestamp";
+            timestamp.textContent = formatTime();
+            messageContainer.appendChild(timestamp);
+            
+            document.getElementById("chat-container").insertBefore(messageContainer, typingIndicator);
+            document.getElementById("chat-container").scrollTop = document.getElementById("chat-container").scrollHeight;
+        }
+
+        function showTypingIndicator() {
+            const typingIndicator = document.getElementById("typing-indicator");
+            typingIndicator.style.display = "block";
+            document.getElementById("chat-container").scrollTop = document.getElementById("chat-container").scrollHeight;
+        }
+
+        function hideTypingIndicator() {
+            const typingIndicator = document.getElementById("typing-indicator");
+            typingIndicator.style.display = "none";
+        }
+
+        function addStatus(text) {
+            // Create status message that will be inserted before the typing indicator
+            const typingIndicator = document.getElementById("typing-indicator");
+            
+            const statusElement = document.createElement("div");
+            statusElement.className = "status";
+            statusElement.textContent = text;
+            
+            document.getElementById("chat-container").insertBefore(statusElement, typingIndicator);
+            document.getElementById("chat-container").scrollTop = document.getElementById("chat-container").scrollHeight;
+            
+            // Return the status element so it can be removed later if needed
+            return statusElement;
+        }
+
+        function sendMessage() {
+            const messageInput = document.getElementById("message-input");
+            const message = messageInput.value.trim();
+            if (!message) return;
+            
+            addMessage(username, message, true);
+            messageInput.value = "";
+            
+            // Disable input during processing
+            messageInput.disabled = true;
+            document.getElementById("send-button").disabled = true;
+            
+            // Show typing indicator
+            showTypingIndicator();
+            
+            fetch("/chat", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ message, session_id: sessionId })
+            })
+            .then(res => res.json())
+            .then(data => {
+                // Always hide typing indicator before proceeding
+                hideTypingIndicator();
+                
+                sessionId = data.session_id || sessionId;
+                localStorage.setItem("chat_session_id", sessionId);
+                addMessage("Linda", data.response);
+                
+                // Speak the response if audio is not muted
+                if (!audioMuted && 'speechSynthesis' in window) {
+                    const speech = new SpeechSynthesisUtterance(data.response);
+                    speech.lang = 'en-US';
+                    speech.onend = function() {
+                        // Optional: Add handling for speech ending
+                    };
+                    speech.onerror = function(event) {
+                        console.error("Speech synthesis error:", event);
+                    };
+                    window.speechSynthesis.speak(speech);
+                }
+            })
+            .catch(error => {
+                // Make sure typing indicator is hidden on error
+                hideTypingIndicator();
+                console.error("Error sending message:", error);
+                addStatus("Error sending message. Please try again.");
+            })
+            .finally(() => {
+                // Re-enable input
+                messageInput.disabled = false;
+                document.getElementById("send-button").disabled = false;
+                messageInput.focus();
+            });
+        }
+
+        // Add event listeners
+        document.getElementById("send-button").addEventListener("click", sendMessage);
+
+        document.getElementById("message-input").addEventListener("keypress", function(event) {
+            if (event.key === "Enter") {
+                event.preventDefault();
+                sendMessage();
+            }
+        });
+        
+        // Audio toggle button handler
+        document.getElementById("audio-toggle").addEventListener("click", function() {
+            audioMuted = !audioMuted;
+            localStorage.setItem("audio_muted", audioMuted);
+            updateAudioToggleButton();
+            
+            if (audioMuted && 'speechSynthesis' in window) {
+                window.speechSynthesis.cancel(); // Stop any ongoing speech
+            }
+        });
+
+        document.getElementById("upload-button").addEventListener("click", function() {
+            const fileInput = document.getElementById("file-input");
+            if (!fileInput.files[0]) {
+                alert("Please select a file first");
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append("file", fileInput.files[0]);
+            formData.append("session_id", sessionId);
+            
+            const uploadStatus = document.getElementById("upload-status");
+            uploadStatus.textContent = "Uploading...";
+            
+            fetch("/upload", {
+                method: "POST",
+                body: formData
+            })
+            .then(res => res.json())
+            .then(data => {
+                uploadStatus.textContent = data.message;
+                setTimeout(() => {
+                    uploadStatus.textContent = "";
+                }, 5000);
+                
+                // Get file name before resetting input
+                const fileName = fileInput.files[0].name;
+                
+                // Reset file input
+                fileInput.value = "";
+                document.querySelector(".file-input-label").textContent = "Choose file to upload";
+                
+                // Add message to chat about successful upload
+                addStatus("File uploaded: " + fileName);
+            })
+            .catch(error => {
+                console.error("Error uploading file:", error);
+                uploadStatus.textContent = "Error uploading file. Please try again.";
+            });
+        });
+
+        // Voice recording functionality
+        let mediaRecorder;
+        let audioChunks = [];
+
+        document.getElementById("record-btn").addEventListener("click", async () => {
+            const recordBtn = document.getElementById("record-btn");
+            const status = document.getElementById("recording-status");
+
+            if (mediaRecorder && mediaRecorder.state === "recording") {
+                mediaRecorder.stop();
+                recordBtn.textContent = "🎤 Record";
+                recordBtn.innerHTML = `
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" fill="white"/>
+                        <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" fill="white"/>
+                    </svg>
+                    Record
+                `;
+                recordBtn.classList.remove("recording");
+                status.textContent = "Processing...";
+                status.classList.remove("active");
+                return;
+            }
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0) {
+                        audioChunks.push(event.data);
+                    }
+                };
+
+                mediaRecorder.onstop = async () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    const formData = new FormData();
+                    formData.append('audio', audioBlob, 'recording.webm');
+                    formData.append('session_id', sessionId);
+
+                    try {
+                        const res = await fetch('/upload_audio', {
+                            method: 'POST',
+                            body: formData
+                        });
+
+                        const data = await res.json();
+                        status.textContent = "✅ Transcribed: " + data.text;
+                        
+                        sessionId = data.session_id || sessionId;
+                        localStorage.setItem("chat_session_id", sessionId);
+
+                        if (data.text) {
+                            addMessage(username, data.text, true);
+                            
+                            // Show typing indicator
+                            showTypingIndicator();
+                            
+                            try {
+                                const chatRes = await fetch('/chat', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ message: data.text, session_id: sessionId })
+                                });
+                                
+                                const chatData = await chatRes.json();
+                                
+                                // Make sure typing indicator is always hidden
+                                hideTypingIndicator();
+                                
+                                addMessage("Linda", chatData.response);
+                                
+                                // Speak the response if audio is not muted
+                                if (!audioMuted && 'speechSynthesis' in window) {
+                                    const speech = new SpeechSynthesisUtterance(chatData.response);
+                                    speech.lang = 'en-US';
+                                    speech.onend = function() {
+                                        // Optional: Add handling for speech ending
+                                    };
+                                    speech.onerror = function(event) {
+                                        console.error("Speech synthesis error:", event);
+                                    };
+                                    window.speechSynthesis.speak(speech);
+                                }
+                            } catch (err) {
+                                // Make sure typing indicator is hidden if there's an error
+                                hideTypingIndicator();
+                                console.error("Error in chat response:", err);
+                                addStatus("Error getting response. Please try again.");
+                            }
+                        } else {
+                            status.textContent = "❓ No speech detected. Please try again.";
+                        }
+                    } catch (err) {
+                        // Make sure typing indicator is hidden here too
+                        hideTypingIndicator();
+                        console.error("Error processing audio:", err);
+                        status.textContent = "❌ Failed to process audio. Please try again.";
+                    }
+                    
+                    // Clear status message after a delay
+                    setTimeout(() => {
+                        status.textContent = "";
+                    }, 5000);
+                };
+
+                mediaRecorder.start();
+                recordBtn.innerHTML = `
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                        <rect x="5" y="5" width="14" height="14" fill="white"/>
+                    </svg>
+                    Stop
+                `;
+                recordBtn.classList.add("recording");
+                status.textContent = "Recording... (click Stop when finished)";
+                status.classList.add("active");
+            } catch (err) {
+                console.error("Microphone error:", err);
+                alert("Microphone access is required to use voice input.");
+            }
+        });
+        
+        // Initialize with welcome message
+        window.onload = function() {
+            setTimeout(() => {
+                addMessage("Linda", "Hello! I'm Linda, your virtual assistant. How can I help you today?");
+                
+                // Speak welcome message if audio is not muted
+                if (!audioMuted && 'speechSynthesis' in window) {
+                    const speech = new SpeechSynthesisUtterance("Hello! I'm Linda, your virtual assistant. How can I help you today?");
+                    speech.lang = 'en-US';
+                    window.speechSynthesis.speak(speech);
+                }
+            }, 500);
+        }
+    </script>
+</body>
+</html>
