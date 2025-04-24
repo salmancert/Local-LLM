@@ -19,7 +19,7 @@ client = PersistentClient(path="chroma_store")
 collection = client.get_or_create_collection("chat_memory")
 
 # ---- Load and Chunk the Document ----
-file_path = "C:/Users/PKCHAUHANSA/OneDrive - Tetra Pak/connected master data SSC.xlsx"  # or .docx, .txt, etc.
+file_path = "FILE LOCATION"  # or .docx, .txt, etc.
 text = parse_document(file_path)
 
 chunk_size = 3000
