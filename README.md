@@ -35,8 +35,8 @@ The assistant leverages local language models through Ollama, maintains conversa
 
 ```bash
 # Clone the repository
-git clone <repository-url>
-cd <repository-name>
+git clone https://github.com/salmancert/Local-LLM.git
+cd Local-LLM
 
 # Create and activate virtual environment
 python -m venv venv
