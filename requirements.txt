@@ -1,0 +1,9 @@
+flask
+fitz
+requests
+frontend
+tools
+chromadb
+openai-whisper
+pyttsx3
+waitress
