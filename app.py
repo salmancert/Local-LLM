@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, jsonify
-from utils.ollama_client import query_ollama
+from utils.foundry_client import query_foundry
 from utils.web_search import search_web  # optional for online use
 from utils.doc_parser import parse_document
 import os
@@ -27,15 +27,26 @@ whisper_model = whisper.load_model("base")  # or "small", "medium", "large"
 # Initialize offline TTS
 tts_engine = pyttsx3.init()
 
-def ollama_embed(text):
-    response = requests.post("http://localhost:11434/api/embeddings", json={
-        "model": "nomic-embed-text",
-        "prompt": text
+def foundry_embed(text):
+    # TODO: The user may need to update the endpoint and API key.
+    url = os.environ.get("FOUNDRY_ENDPOINT", "http://localhost:8000/v1/embeddings")
+    api_key = os.environ.get("FOUNDRY_API_KEY", "")
+    embedding_model = os.environ.get("FOUNDRY_EMBEDDING_MODEL", "nomic-embed-text")
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    response = requests.post(url, headers=headers, json={
+        "model": embedding_model,
+        "input": text
     })
-    return response.json()['embedding']
+    return response.json()['data'][0]['embedding']
 
 def save_to_memory(role, text, session_id, response=None):
-    embedding = ollama_embed(text)
+    embedding = foundry_embed(text)
     doc_id = str(uuid.uuid4())
     timestamp = datetime.datetime.now().isoformat()
 
@@ -55,7 +66,7 @@ def save_to_memory(role, text, session_id, response=None):
     )
 
 def retrieve_context(query, top_k=5):
-    query_embedding = ollama_embed(query)
+    query_embedding = foundry_embed(query)
     results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
     return "\n".join(results["documents"][0]) if results["documents"] else ""
 
@@ -98,7 +109,7 @@ def chat():
     else:
         context = retrieve_context(user_message)
         prompt = f"{context}\n\nUser: {user_message}\nAssistant:"
-        response = query_ollama(prompt)
+        response = query_foundry(prompt)
 
     save_to_memory("user", user_message, session_id, response)
     save_to_memory("assistant", response, session_id)
