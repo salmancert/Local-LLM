@@ -21,3 +21,9 @@ soundfile
 # a future major bump could change the client API again (it already did
 # once, from the classic ClientSession/stdio_client pattern to `Client`).
 mcp>=2,<3
+
+# Native local tools (utils/local_tools.py): spreadsheets, Word documents,
+# and web page text extraction. PDF reuses PyMuPDF above.
+openpyxl
+python-docx
+beautifulsoup4

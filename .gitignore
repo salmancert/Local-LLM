@@ -5,6 +5,10 @@ venv/
 uploads/
 audio/
 
+# Sandboxed working directory for utils/local_tools.py's file tools --
+# whatever Iris reads/writes (spreadsheets, docs, PDFs, notes) lands here.
+workspace/
+
 # May contain machine-specific paths/credentials for MCP servers (e.g. a
 # Power BI MCP server's auth). Copy mcp_servers.example.json to get started.
 mcp_servers.json

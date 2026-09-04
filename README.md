@@ -15,11 +15,13 @@ The assistant leverages local language models through [Microsoft Foundry Local](
 │   └── chat.html       # Main chat interface template
 ├── models/
 │   └── kokoro/           # Bundled Kokoro TTS model weights (see Text-to-Speech below)
-├── mcp_servers.example.json  # Template for configuring MCP tool servers (e.g. Power BI)
+├── mcp_servers.example.json  # Template for configuring MCP tool servers (e.g. Power BI, Outlook)
+├── workspace/            # Sandbox for local_tools.py's file tools (created at runtime, gitignored)
 └── utils/              # Utility modules
     ├── doc_parser.py       # Document parsing functionality
     ├── embedding_store.py  # Standalone ChromaDB + sentence-transformers helper
     ├── foundry_client.py   # Client for local Foundry Local inference/embeddings
+    ├── local_tools.py       # Native tools: spreadsheets, Word, PDF, notepad, web fetch, email, shell
     ├── mcp_manager.py       # Generic MCP client -- connects configured tool servers
     ├── tts.py               # Offline text-to-speech (Kokoro / pyttsx3)
     └── web_search.py        # Optional web search functionality
@@ -79,6 +81,9 @@ All configuration is via environment variables; sensible local defaults are used
 | `TTS_LANG` | `en-us` | Kokoro language (e.g. `en-us`, `en-gb`, `fr-fr`, `ja`, `zh` -- must match the chosen voice) |
 | `KOKORO_MODEL_PATH` | `models/kokoro/kokoro-v1.0.int8.onnx` | Override the bundled Kokoro model file |
 | `KOKORO_VOICES_PATH` | `models/kokoro/voices-v1.0.bin` | Override the bundled Kokoro voices file |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` | *(unset)* | Enables the `local__send_email` tool when all of `SMTP_HOST`/`SMTP_USER`/`SMTP_PASSWORD` are set (`SMTP_PORT` defaults to `587`) |
+| `ENABLE_SHELL_TOOL` | `false` | Set `true` to enable `local__run_shell_command` -- read the Tool Calling section before turning this on |
+| `SHELL_TOOL_TIMEOUT` | `30` | Seconds before a shell command is killed, when the shell tool is enabled |
 
 Make sure the model aliases you configure are actually available in your Foundry Local catalog (`foundry model list`); if an embedding call fails (e.g. the alias isn't available), the app logs a warning and continues without that memory/context lookup rather than crashing the chat request.
 
@@ -126,29 +131,57 @@ Click **Deep think** in the control bar to have the model reason step by step in
 
 **Off by default.** Asking the model to write out a full reasoning trace before every answer roughly doubles output length, which is real, noticeable latency on a small model running locally on CPU -- not something worth paying on every "hi". With Deep think off, replies use a short, direct system prompt and a lower token cap (`max_tokens=400` vs `800`), so the fast path stays fast; Deep think is there for when you actually want the model to slow down and work through something carefully.
 
-### Tool Calling / MCP (e.g. Power BI)
+### Tool Calling
 
-Iris can call tools exposed by any [MCP](https://modelcontextprotocol.io) server you configure -- a Power BI MCP server included, since Foundry Local's chat completions API supports standard OpenAI-style `tools`/`tool_calls` for models tagged with the `tools` task in `foundry model list` (`qwen2.5-1.5b` is one). `utils/mcp_manager.py` is generic: it doesn't know or care what server it's talking to, so any MCP server (Power BI, filesystem, a custom one) works the same way.
+Iris can call tools -- Foundry Local's chat completions API supports standard OpenAI-style `tools`/`tool_calls` for models tagged with the `tools` task in `foundry model list` (`qwen2.5-1.5b` is one). Tools come from two places, merged into one list by `get_all_tools()` in `app.py`:
+
+- **Native local tools** (`utils/local_tools.py`) -- always available, no setup, no external process. Run in-process against a sandboxed `workspace/` folder in the repo root.
+- **MCP servers** (`utils/mcp_manager.py`) -- anything you configure in `mcp_servers.json`, e.g. Power BI.
+
+**How it works end to end:** every tool -- local or MCP -- is exposed to Foundry Local as an OpenAI-format function definition (`local__toolname` for native tools, `servername__toolname` for MCP ones, so names never collide). When the model responds with a tool call, `run_completion()` in `app.py` dispatches it to the right place, feeds the result back as a `tool` message, and asks the model to continue -- repeating up to `MAX_TOOL_ROUNDS` (4) times before giving up, so a model stuck in a call loop can't hang a request forever.
+
+Small local models are not always reliable at deciding when/how to call tools -- expect to iterate on tool names/descriptions if calls aren't happening when you'd expect, and expect the occasional malformed call (handled: JSON-parse failures fall back to `{}` arguments rather than crashing the request).
+
+#### Native tools: spreadsheets, Word, PDF, notepad, web browsing
+
+| Tool | Does |
+|---|---|
+| `local__read_text_file` / `local__write_text_file` | Plain text files (Notepad-like) |
+| `local__read_pdf` / `local__create_pdf` | Read a PDF's text; create a new PDF from text |
+| `local__read_spreadsheet` / `local__write_spreadsheet` | `.csv`, `.xlsx`, `.xlsm` -- read returns tab-separated rows, write takes rows of cell values |
+| `local__read_word_document` / `local__write_word_document` | `.docx` |
+| `local__fetch_webpage` | Fetch a URL, strip scripts/nav/styling, return readable text -- this is "web browsing": research and reading, not clicking/filling forms (see Playwright below for that) |
+| `local__list_workspace_files` | List what's in the workspace |
+
+**Everything above is sandboxed to `workspace/`** (created automatically, gitignored). Every path a tool touches is resolved and checked to stay inside it -- no `..` traversal, no absolute paths -- so a tool call can read or overwrite files there and nowhere else on your machine. This matters because tool calls are LLM-decided, and the model's context can include content from outside the conversation (a fetched web page, an MCP tool's output, an uploaded document) -- treat that the same as any other prompt-injection surface. The sandbox is the actual safety boundary here, not a suggestion to the model.
+
+Two more native tools exist but are **off unless you configure them**:
+
+- `local__send_email` -- only offered to the model if `SMTP_HOST`, `SMTP_USER`, and `SMTP_PASSWORD` are set (works with Gmail, Outlook.com, or any SMTP provider's app-password auth). For reading/managing an actual Outlook inbox or calendar, use an MCP server instead (see below) -- that needs Microsoft Graph/OAuth, which is a better fit for a dedicated, already-vetted server than something to hand-roll here.
+- `local__run_shell_command` -- **off by default**, and worth actually deciding rather than flipping on reflexively. Set `ENABLE_SHELL_TOOL=true` to enable it; it runs PowerShell on Windows or `/bin/sh` elsewhere, in the `workspace/` directory, with a timeout (`SHELL_TOOL_TIMEOUT`, default 30s). This is arbitrary command execution decided by an LLM that can be steered by anything in its context (a malicious web page it fetched, a crafted document, a compromised MCP tool result) -- there's no reliable way to sandbox "run whatever command the model wants" the way file paths can be sandboxed. Only turn it on if you understand and accept that, and note that `app.py` binds Flask to `0.0.0.0` by default (see Troubleshooting) -- if this machine is reachable on your network, so is anything this tool can do.
+
+#### MCP servers: Power BI, Outlook, browser automation, and anything else
+
+For integrations that need a real running application or an OAuth app registration, point `utils/mcp_manager.py` at a dedicated MCP server instead of reimplementing that integration here. It's generic -- it doesn't know or care what server it's talking to.
 
 **Setup:**
-1. Copy `mcp_servers.example.json` to `mcp_servers.json` (gitignored -- it may end up holding paths or credentials specific to your machine).
-2. Point it at an MCP server. Several Power BI MCP servers exist, e.g. [microsoft/powerbi-modeling-mcp](https://github.com/microsoft/powerbi-modeling-mcp) or [sulaiman013/powerbi-mcp](https://github.com/sulaiman013/powerbi-mcp) -- follow that server's own README for auth/setup, then point `command`/`args`/`env` at however it's launched (most run via `npx`):
-   ```json
-   {
-     "mcpServers": {
-       "powerbi": {
-         "command": "npx",
-         "args": ["-y", "@microsoft/powerbi-modeling-mcp"],
-         "env": { "POWER_BI_...": "..." }
-       }
-     }
-   }
-   ```
+1. Copy `mcp_servers.example.json` to `mcp_servers.json` (gitignored -- it may end up holding paths or credentials specific to your machine). Only add the servers you actually want; every entry gets launched and connected to at startup.
+2. Add an entry per server, pointing `command`/`args`/`env` at however that server is launched (most run via `npx`) -- follow that server's own README for auth/setup:
+   - **Power BI**: [microsoft/powerbi-modeling-mcp](https://github.com/microsoft/powerbi-modeling-mcp) or [sulaiman013/powerbi-mcp](https://github.com/sulaiman013/powerbi-mcp)
+     ```json
+     "powerbi": { "command": "npx", "args": ["-y", "@microsoft/powerbi-modeling-mcp"], "env": {} }
+     ```
+   - **Outlook / Microsoft 365** (mail, calendar, Excel, more): [Softeria/ms-365-mcp-server](https://github.com/Softeria/ms-365-mcp-server)
+     ```json
+     "outlook": { "command": "npx", "args": ["-y", "@softeria/ms-365-mcp-server"], "env": {} }
+     ```
+   - **Browser automation** (clicking, filling forms, JS-rendered pages -- beyond what `local__fetch_webpage` can do): Microsoft's official [Playwright MCP](https://github.com/microsoft/playwright-mcp)
+     ```json
+     "browser": { "command": "npx", "args": ["-y", "@playwright/mcp@latest"], "env": {} }
+     ```
 3. Restart the app. On startup it connects to every configured server in the background (over stdio) and lists their tools; this never blocks a request -- a chat that arrives before a server finishes connecting just proceeds without tools for that one turn.
 
-**How it works end to end:** each MCP server's tools are exposed to Foundry Local as OpenAI-format function definitions (tool names prefixed `servername__toolname` to avoid collisions across servers). When the model responds with a tool call, `app.py`'s loop in `/chat` executes it via the right MCP server, feeds the result back as a `tool` message, and asks the model to continue -- repeating up to `MAX_TOOL_ROUNDS` (4) times before giving up, so a model stuck in a call loop can't hang a request forever.
-
-**Zero cost when unused.** With no `mcp_servers.json`, `get_openai_tools()` returns `[]` and no `tools` parameter is even sent to Foundry Local -- behavior and latency are identical to not having this feature at all. Small local models are also not always reliable at deciding when/how to call tools -- expect to iterate on tool names/descriptions if calls aren't happening when you'd expect.
+**Zero cost when unused.** With no `mcp_servers.json` and none of the opt-in native tools configured, `get_all_tools()` returns `[]` and no `tools` parameter is even sent to Foundry Local -- behavior and latency are identical to not having this feature at all.
 
 ### Workforce: Multi-Agent Task Orchestration (opt-in)
 

@@ -5,6 +5,7 @@ from utils.tts import synthesize_to_file, warm_up as warm_up_tts
 from utils.web_search import search_web  # optional for online use
 from utils.doc_parser import parse_document
 from utils import mcp_manager
+from utils import local_tools
 import os
 import re
 import json
@@ -81,11 +82,22 @@ def build_system_prompt(tools_available, deep_think):
         parts.append(_COT_INSTRUCTIONS)
     return "\n\n".join(parts)
 
+def get_all_tools():
+    """Native local tools (spreadsheets, Word docs, PDFs, text files, web
+    fetch, and opt-in email/shell -- see utils/local_tools.py) plus
+    whatever's exposed by connected MCP servers (e.g. Power BI)."""
+    return local_tools.get_tool_schemas() + mcp_manager.get_openai_tools()
+
+def dispatch_tool_call(name, arguments):
+    if local_tools.is_local_tool(name):
+        return local_tools.call_tool(name, arguments)
+    return mcp_manager.call_tool(name, arguments)
+
 def run_completion(messages, tools, max_tokens):
     """Run one full turn against Foundry Local, including any tool-call
-    round trips (see utils/mcp_manager.py), and return the final text
-    content. `messages` is mutated in place with the assistant/tool turns
-    the model made along the way."""
+    round trips (native local tools and/or MCP servers), and return the
+    final text content. `messages` is mutated in place with the
+    assistant/tool turns the model made along the way."""
     message = query_foundry(messages, max_tokens=max_tokens, tools=tools)
 
     rounds = 0
@@ -107,7 +119,7 @@ def run_completion(messages, tools, max_tokens):
                 arguments = json.loads(tc.function.arguments or "{}")
             except json.JSONDecodeError:
                 arguments = {}
-            result_text = mcp_manager.call_tool(tc.function.name, arguments)
+            result_text = dispatch_tool_call(tc.function.name, arguments)
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
 
         rounds += 1
@@ -308,7 +320,7 @@ def chat():
     else:
         history = get_conversation_history(session_id)
         doc_context = retrieve_document_context(user_message, session_id)
-        tools = mcp_manager.get_openai_tools()  # [] if none configured/connected
+        tools = get_all_tools()  # local tools + whatever MCP servers are connected
 
         outcome = run_workforce(user_message, doc_context, tools, deep_think) if workforce else None
         if outcome:
