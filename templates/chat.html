@@ -288,6 +288,48 @@
             background-color: #d68910;
         }
 
+        #workforce-toggle {
+            background-color: #a9a9a9;
+            margin-left: 10px;
+        }
+
+        #workforce-toggle.active {
+            background-color: #2471a3;
+        }
+
+        .breakdown {
+            margin-top: 8px;
+            text-align: left;
+        }
+
+        .breakdown summary {
+            cursor: pointer;
+            font-size: 12px;
+            color: var(--text-secondary);
+            user-select: none;
+        }
+
+        .breakdown-content {
+            margin-top: 6px;
+            padding: 8px 10px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            background-color: rgba(0, 0, 0, 0.04);
+            border-radius: 4px;
+        }
+
+        .breakdown-item {
+            margin-bottom: 8px;
+        }
+
+        .breakdown-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .breakdown-item .subtask {
+            font-weight: bold;
+        }
+
         @media (max-width: 768px) {
             body {
                 padding: 10px;
@@ -351,6 +393,15 @@
             </svg>
             Deep think: off
         </button>
+        <button id="workforce-toggle" title="Break complex requests into subtasks handled by a team of workers">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <circle cx="6" cy="6" r="2.5" fill="white"/>
+                <circle cx="18" cy="6" r="2.5" fill="white"/>
+                <circle cx="12" cy="18" r="2.5" fill="white"/>
+                <path d="M6 8.5V12h5v3.5M18 8.5V12h-5v3.5" stroke="white" stroke-width="1.5" fill="none"/>
+            </svg>
+            Workforce: off
+        </button>
         <span id="recording-status"></span>
     </div>
     <div id="upload-status"></div>
@@ -386,6 +437,24 @@
             deepThink = !deepThink;
             localStorage.setItem("deep_think", deepThink);
             updateDeepThinkButton();
+        });
+
+        // Workforce mode -- off by default. When on, complex requests get
+        // broken into subtasks handled by a small team of workers instead
+        // of a single reply; several extra model calls, so opt-in.
+        let workforce = localStorage.getItem("workforce") === "true" || false;
+        const workforceBtn = document.getElementById("workforce-toggle");
+
+        function updateWorkforceButton() {
+            workforceBtn.textContent = workforce ? "Workforce: on" : "Workforce: off";
+            workforceBtn.classList.toggle("active", workforce);
+        }
+        updateWorkforceButton();
+
+        document.getElementById("workforce-toggle").addEventListener("click", function() {
+            workforce = !workforce;
+            localStorage.setItem("workforce", workforce);
+            updateWorkforceButton();
         });
 
         // Audio settings
@@ -529,7 +598,7 @@
             return result.join('\n');
         }
 
-        function addMessage(sender, text, isUser = false, thinking = null) {
+        function addMessage(sender, text, isUser = false, thinking = null, breakdown = null) {
             // Add message before the typing indicator
             const typingIndicator = document.getElementById("typing-indicator");
 
@@ -569,6 +638,31 @@
                 reasoning.className = "thinking-content";
                 reasoning.textContent = thinking;
                 details.appendChild(reasoning);
+                messageContainer.appendChild(details);
+            }
+
+            // Workforce task breakdown, collapsed by default
+            if (!isUser && breakdown && breakdown.length) {
+                const details = document.createElement("details");
+                details.className = "breakdown";
+                const summary = document.createElement("summary");
+                summary.textContent = `Show task breakdown (${breakdown.length} subtask${breakdown.length === 1 ? "" : "s"})`;
+                details.appendChild(summary);
+                const list = document.createElement("div");
+                list.className = "breakdown-content";
+                breakdown.forEach(item => {
+                    const entry = document.createElement("div");
+                    entry.className = "breakdown-item";
+                    const subtaskEl = document.createElement("div");
+                    subtaskEl.className = "subtask";
+                    subtaskEl.textContent = item.subtask;
+                    const resultEl = document.createElement("div");
+                    resultEl.textContent = item.result;
+                    entry.appendChild(subtaskEl);
+                    entry.appendChild(resultEl);
+                    list.appendChild(entry);
+                });
+                details.appendChild(list);
                 messageContainer.appendChild(details);
             }
 
@@ -625,7 +719,7 @@
             fetch("/chat", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ message, session_id: sessionId, deep_think: deepThink })
+                body: JSON.stringify({ message, session_id: sessionId, deep_think: deepThink, workforce: workforce })
             })
             .then(res => res.json())
             .then(data => {
@@ -634,7 +728,7 @@
                 
                 sessionId = data.session_id || sessionId;
                 localStorage.setItem("chat_session_id", sessionId);
-                addMessage("Iris", data.response, false, data.thinking);
+                addMessage("Iris", data.response, false, data.thinking, data.breakdown);
 
                 // Speak the response if audio is not muted
                 speakResponse(data.response, data.audio_url);
@@ -778,7 +872,7 @@
                                 const chatRes = await fetch('/chat', {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ message: data.text, session_id: sessionId, deep_think: deepThink })
+                                    body: JSON.stringify({ message: data.text, session_id: sessionId, deep_think: deepThink, workforce: workforce })
                                 });
                                 
                                 const chatData = await chatRes.json();
@@ -786,7 +880,7 @@
                                 // Make sure typing indicator is always hidden
                                 hideTypingIndicator();
                                 
-                                addMessage("Iris", chatData.response, false, chatData.thinking);
+                                addMessage("Iris", chatData.response, false, chatData.thinking, chatData.breakdown);
 
                                 // Speak the response if audio is not muted
                                 speakResponse(chatData.response, chatData.audio_url);

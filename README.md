@@ -150,6 +150,18 @@ Iris can call tools exposed by any [MCP](https://modelcontextprotocol.io) server
 
 **Zero cost when unused.** With no `mcp_servers.json`, `get_openai_tools()` returns `[]` and no `tools` parameter is even sent to Foundry Local -- behavior and latency are identical to not having this feature at all. Small local models are also not always reliable at deciding when/how to call tools -- expect to iterate on tool names/descriptions if calls aren't happening when you'd expect.
 
+### Workforce: Multi-Agent Task Orchestration (opt-in)
+
+Click **Workforce** to have complex requests handled by a small team of agents instead of one reply -- the same idea as [Eigent](https://github.com/eigent-ai/eigent)'s multi-agent Workforce (built on CAMEL-AI), scaled down to fit a single local model. See `run_workforce` and friends in `app.py`:
+
+1. **Plan** -- a coordinator call asks the model to break your request into a short list of concrete, independent subtasks (a JSON array). If it decides the request doesn't need breaking down, Workforce mode gets out of the way and you get a normal reply instead -- no orchestration tax on a simple message just because the toggle is on.
+2. **Work** -- each subtask is dispatched to a stateless worker (its own fresh completion, with its own `<thinking>`-free system prompt) that can call MCP tools just like the main chat can -- so, for example, three workers could each pull a different Power BI metric in parallel. Workers run on a small thread pool (`WORKFORCE_MAX_WORKERS`, default 3); if one fails, its error is captured and the rest continue rather than the whole request failing.
+3. **Synthesize** -- once every worker has a result, one final call combines them into a single coherent answer (this step respects Deep think if it's also on).
+
+The reply includes a `breakdown` (list of `{subtask, result}`) whenever real decomposition happened, rendered as a collapsed "Show task breakdown" toggle under the reply, so you can see what each worker actually did.
+
+**Honest caveats:** this is several sequential-or-parallel LLM calls per request (1 plan + N workers + 1 synthesis), so it's slower than a normal reply -- that's why it's opt-in, same as Deep think. "Parallel" is best-effort: workers are dispatched concurrently from Python's side, but Foundry Local serves one model instance, so actual wall-clock speedup depends on whether it can service concurrent requests or just queues them -- either way the result is correct, just not necessarily faster than sequential on a single-GPU/CPU box. And a 1.5B local model's plans and worker outputs are meaningfully weaker than what you'd get from a frontier-model-backed Workforce -- expect to iterate on subtask quality, same as with tool calling.
+
 ### Troubleshooting
 
 1. Foundry Local Connection Issues
@@ -196,7 +208,8 @@ Key Component Interactions:
 2. Speech input is transcribed using Whisper
 3. The session's actual chat history is replayed to the model verbatim (not semantic search -- see Conversation Memory above); documents uploaded in that session are searched semantically for relevant chunks
 4. If MCP servers are configured, their tools are offered to the model, which may call one or more before producing a final answer (see Tool Calling / MCP above)
-5. With Deep think on, the model reasons step by step before answering (see Chain-of-Thought Reasoning above); off by default for responsiveness
-6. The final answer (reasoning stripped) is stored in ChromaDB for future turns
-7. The final answer is synthesized to a local audio file and played by the browser; the reasoning, if any, is shown separately as an optional, collapsed toggle
-8. Web search integration provides additional information (optional)
+5. If Workforce is on and the request is complex enough, steps 3-4 happen per-subtask across a small team of workers instead of once, then a synthesis call combines their results (see Workforce above); simple requests skip this and fall through to the normal single-reply path even with the toggle on
+6. With Deep think on, the model (or the workforce's synthesis step) reasons step by step before answering (see Chain-of-Thought Reasoning above); off by default for responsiveness
+7. The final answer (reasoning stripped) is stored in ChromaDB for future turns
+8. The final answer is synthesized to a local audio file and played by the browser; the reasoning and/or task breakdown, if any, are shown separately as optional, collapsed toggles
+9. Web search integration provides additional information (optional)

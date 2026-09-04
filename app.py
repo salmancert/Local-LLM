@@ -11,6 +11,7 @@ import json
 import uuid
 import datetime
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from chromadb import PersistentClient
 from chromadb.config import Settings
 import whisper
@@ -79,6 +80,40 @@ def build_system_prompt(tools_available, deep_think):
     if deep_think:
         parts.append(_COT_INSTRUCTIONS)
     return "\n\n".join(parts)
+
+def run_completion(messages, tools, max_tokens):
+    """Run one full turn against Foundry Local, including any tool-call
+    round trips (see utils/mcp_manager.py), and return the final text
+    content. `messages` is mutated in place with the assistant/tool turns
+    the model made along the way."""
+    message = query_foundry(messages, max_tokens=max_tokens, tools=tools)
+
+    rounds = 0
+    while getattr(message, "tool_calls", None) and rounds < MAX_TOOL_ROUNDS:
+        messages.append({
+            "role": "assistant",
+            "content": message.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": tc.type,
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in message.tool_calls
+            ],
+        })
+        for tc in message.tool_calls:
+            try:
+                arguments = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+            result_text = mcp_manager.call_tool(tc.function.name, arguments)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
+
+        rounds += 1
+        message = query_foundry(messages, max_tokens=max_tokens, tools=tools)
+
+    return message.content or ""
 
 _THINKING_RE = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL | re.IGNORECASE)
 _ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
@@ -154,6 +189,105 @@ def retrieve_document_context(query, session_id, top_k=3):
     docs = results.get("documents") or []
     return "\n".join(docs[0]) if docs and docs[0] else ""
 
+# --- Workforce: break a complex request into subtasks, run them (with
+# tools) on a small pool of worker "agents", then synthesize one answer.
+# Inspired by Eigent/CAMEL-AI's multi-agent Workforce pattern, scaled down
+# for a single local model: workers are stateless per-subtask completions
+# (not full separate agent processes), and "parallel" is best-effort --
+# Foundry Local serves one model instance, so true wall-clock speedup
+# depends on whether it can service concurrent requests; either way the
+# code stays correct if it just serializes them. Opt-in (like Deep think)
+# since planning + N workers + synthesis is several LLM calls, not one.
+MAX_WORKFORCE_SUBTASKS = 5
+WORKFORCE_MAX_WORKERS = 3
+
+_PLAN_LIST_RE = re.compile(r"\[.*\]", re.DOTALL)
+
+def plan_subtasks(user_message, doc_context):
+    system_parts = ["You are the planning coordinator for Iris, a helpful local AI assistant."]
+    if doc_context:
+        system_parts.append(f"Relevant context from the user's uploaded documents:\n{doc_context}")
+    system_parts.append(
+        "Break the user's request into a short list of concrete, self-contained "
+        "subtasks that separate specialist workers can each complete independently, "
+        f"in any order. Respond with ONLY a JSON array of 1 to {MAX_WORKFORCE_SUBTASKS} "
+        "short subtask description strings -- no prose, no markdown fences, nothing else. "
+        "If the request is simple enough that breaking it down wouldn't help, respond "
+        "with a single-item array containing the request itself, unchanged."
+    )
+    messages = [
+        {"role": "system", "content": "\n\n".join(system_parts)},
+        {"role": "user", "content": user_message},
+    ]
+    raw = run_completion(messages, tools=[], max_tokens=300)
+
+    match = _PLAN_LIST_RE.search(raw)
+    if match:
+        try:
+            subtasks = json.loads(match.group(0))
+            subtasks = [str(s).strip() for s in subtasks if str(s).strip()]
+            if subtasks:
+                return subtasks[:MAX_WORKFORCE_SUBTASKS]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return [user_message]  # couldn't parse a plan -- treat as a single task
+
+def run_worker(subtask, tools):
+    """A focused, stateless worker: only sees its own subtask, not the
+    conversation or the other workers -- matches the Workforce pattern
+    where the coordinator holds context and workers are dispatched fresh."""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a focused specialist worker completing exactly one subtask "
+                "as part of a larger effort coordinated by Iris. Do only this subtask, "
+                "be concise and concrete, and use tools if they help."
+            ),
+        },
+        {"role": "user", "content": subtask},
+    ]
+    result = run_completion(messages, tools, max_tokens=500)
+    return split_thinking(result)[0]  # strip any stray <thinking> tags
+
+def synthesize_workforce_result(user_message, subtask_results, deep_think):
+    summary = "\n\n".join(f"Subtask: {s}\nResult: {r}" for s, r in subtask_results)
+    system = build_system_prompt(False, deep_think) + (
+        "\n\nYou coordinated a team of specialist workers to handle the user's "
+        "request below. Combine their results into one clear, well-organized "
+        "final answer -- synthesize, don't just list the subtasks back."
+    )
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": f"Original request: {user_message}\n\nWorker results:\n{summary}"},
+    ]
+    max_tokens = 800 if deep_think else 500
+    raw = run_completion(messages, tools=[], max_tokens=max_tokens)
+    return split_thinking(raw)
+
+def run_workforce(user_message, doc_context, tools, deep_think):
+    """Returns (response, thinking, breakdown), or None if the planner
+    decided the request doesn't need decomposing -- callers should fall
+    back to a normal single-agent reply in that case."""
+    subtasks = plan_subtasks(user_message, doc_context)
+    if len(subtasks) <= 1:
+        return None
+
+    subtask_results = [None] * len(subtasks)
+    with ThreadPoolExecutor(max_workers=WORKFORCE_MAX_WORKERS) as pool:
+        futures = {pool.submit(run_worker, subtask, tools): i for i, subtask in enumerate(subtasks)}
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                subtask_results[i] = future.result()
+            except Exception as e:
+                subtask_results[i] = f"[worker error: {e}]"
+
+    pairs = list(zip(subtasks, subtask_results))
+    response, thinking = synthesize_workforce_result(user_message, pairs, deep_think)
+    breakdown = [{"subtask": s, "result": r} for s, r in pairs]
+    return response, thinking, breakdown
+
 @app.route('/')
 def index():
     return render_template('chat.html')
@@ -164,8 +298,10 @@ def chat():
     user_message = data['message']
     session_id = data.get('session_id', str(uuid.uuid4()))
     deep_think = bool(data.get('deep_think'))
+    workforce = bool(data.get('workforce'))
 
     thinking = None
+    breakdown = None
     if user_message.lower().startswith("search:"):
         query = user_message.replace("search:", "").strip()
         response = search_web(query)  # remove if fully offline
@@ -174,45 +310,25 @@ def chat():
         doc_context = retrieve_document_context(user_message, session_id)
         tools = mcp_manager.get_openai_tools()  # [] if none configured/connected
 
-        messages = [{"role": "system", "content": build_system_prompt(bool(tools), deep_think)}]
-        if doc_context:
-            messages.append({
-                "role": "system",
-                "content": f"Relevant context from the user's uploaded documents:\n{doc_context}",
-            })
-        messages.extend(history)
-        messages.append({"role": "user", "content": user_message})
+        outcome = run_workforce(user_message, doc_context, tools, deep_think) if workforce else None
+        if outcome:
+            response, thinking, breakdown = outcome
+        else:
+            # Either workforce is off, or the planner decided this request
+            # doesn't need decomposing -- either way, a normal single-agent
+            # reply, with the session's conversation history included.
+            messages = [{"role": "system", "content": build_system_prompt(bool(tools), deep_think)}]
+            if doc_context:
+                messages.append({
+                    "role": "system",
+                    "content": f"Relevant context from the user's uploaded documents:\n{doc_context}",
+                })
+            messages.extend(history)
+            messages.append({"role": "user", "content": user_message})
 
-        max_tokens = 800 if deep_think else 400
-        message = query_foundry(messages, max_tokens=max_tokens, tools=tools)
-
-        rounds = 0
-        while getattr(message, "tool_calls", None) and rounds < MAX_TOOL_ROUNDS:
-            messages.append({
-                "role": "assistant",
-                "content": message.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": tc.type,
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in message.tool_calls
-                ],
-            })
-            for tc in message.tool_calls:
-                try:
-                    arguments = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    arguments = {}
-                result_text = mcp_manager.call_tool(tc.function.name, arguments)
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
-
-            rounds += 1
-            message = query_foundry(messages, max_tokens=max_tokens, tools=tools)
-
-        raw_response = message.content or ""
-        response, thinking = split_thinking(raw_response)
+            max_tokens = 800 if deep_think else 400
+            raw_response = run_completion(messages, tools, max_tokens)
+            response, thinking = split_thinking(raw_response)
 
     save_to_memory("user", user_message, session_id)
     save_to_memory("assistant", response, session_id)
@@ -229,7 +345,13 @@ def chat():
     except Exception as e:
         print(f"[TTS error: {e}]")
 
-    return jsonify({"response": response, "thinking": thinking, "session_id": session_id, "audio_url": audio_url})
+    return jsonify({
+        "response": response,
+        "thinking": thinking,
+        "breakdown": breakdown,
+        "session_id": session_id,
+        "audio_url": audio_url,
+    })
 
 @app.route('/audio/<path:filename>')
 def get_audio(filename):
