@@ -1,5 +1,6 @@
 import os
 from functools import lru_cache
+from types import SimpleNamespace
 
 # Foundry Local does not listen on a fixed, well-known port -- the actual
 # service is started on demand and its port is chosen at runtime. The
@@ -52,20 +53,32 @@ def _get_client_and_model_id(alias):
     return client, model_id
 
 
-def query_foundry(messages, model=None, max_tokens=None):
-    """messages: a list of {"role": "system"|"user"|"assistant", "content": str},
+def query_foundry(messages, model=None, max_tokens=None, tools=None, tool_choice=None):
+    """messages: a list of {"role": "system"|"user"|"assistant"|"tool", ...},
     e.g. the running conversation so far plus the new user turn -- callers
-    are responsible for including whatever history the model should see."""
+    are responsible for including whatever history the model should see.
+
+    tools: an optional OpenAI-format `tools` list (see utils/mcp_manager.py);
+    omitted/empty means no tool calling is offered to the model at all.
+
+    Returns the raw response message (an object with `.content` and
+    `.tool_calls`, matching the OpenAI SDK), not just the text, so callers
+    can detect and act on tool calls. On a connection error, returns a
+    stand-in object with `.content` set to an error string and
+    `.tool_calls` set to None, so callers can handle both cases uniformly."""
     alias = model or DEFAULT_CHAT_MODEL
     try:
         client, model_id = _get_client_and_model_id(alias)
         kwargs = {"model": model_id, "messages": messages}
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice or "auto"
         response = client.chat.completions.create(**kwargs)
-        return response.choices[0].message.content
+        return response.choices[0].message
     except Exception as e:
-        return f"[Foundry connection error: {e}]"
+        return SimpleNamespace(content=f"[Foundry connection error: {e}]", tool_calls=None)
 
 
 def foundry_embed(text, model=None):

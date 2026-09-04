@@ -15,10 +15,12 @@ The assistant leverages local language models through [Microsoft Foundry Local](
 │   └── chat.html       # Main chat interface template
 ├── models/
 │   └── kokoro/           # Bundled Kokoro TTS model weights (see Text-to-Speech below)
+├── mcp_servers.example.json  # Template for configuring MCP tool servers (e.g. Power BI)
 └── utils/              # Utility modules
     ├── doc_parser.py       # Document parsing functionality
     ├── embedding_store.py  # Standalone ChromaDB + sentence-transformers helper
     ├── foundry_client.py   # Client for local Foundry Local inference/embeddings
+    ├── mcp_manager.py       # Generic MCP client -- connects configured tool servers
     ├── tts.py               # Offline text-to-speech (Kokoro / pyttsx3)
     └── web_search.py        # Optional web search functionality
 ```
@@ -118,9 +120,35 @@ If TTS fails entirely, the frontend falls back to the browser's built-in `speech
 
 Each `/chat` request rebuilds the actual chronological conversation for that `session_id` (up to the last `MAX_HISTORY_MESSAGES` turns, in `app.py`) from ChromaDB and sends it to Foundry Local as proper multi-turn messages, so follow-up questions ("what about the second one?") work the way they would in any chat app. This is deliberately *not* semantic search -- a follow-up often shares no vocabulary with the turn it's following up on, so similarity search alone misses it. Semantic search is still used, but only for retrieving relevant chunks from documents *you uploaded in that same session* (`retrieve_document_context` in `app.py`), which is a different problem (finding the right needle in a large haystack) than recalling what was just said.
 
-### Chain-of-Thought Reasoning
+### Chain-of-Thought Reasoning (opt-in)
 
-The system prompt (`SYSTEM_PROMPT` in `app.py`) asks the model to reason step by step in a `<thinking>...</thinking>` block before giving its `<answer>...</answer>`. The backend splits these apart: only the `<answer>` text is spoken (TTS), shown as the main reply, and stored back into conversation memory, while the reasoning is returned separately as `thinking` and rendered as a collapsed "Show reasoning" toggle under the reply in the UI. Small local models don't always follow the format perfectly -- if the tags are missing or truncated, the code falls back gracefully to using the raw response as the answer with no reasoning trace.
+Click **Deep think** in the control bar to have the model reason step by step in a `<thinking>...</thinking>` block before giving its `<answer>...</answer>` (sent as `deep_think: true` on `/chat`; see `build_system_prompt` in `app.py`). The backend splits these apart: only the `<answer>` text is spoken (TTS), shown as the main reply, and stored back into conversation memory, while the reasoning is returned separately as `thinking` and rendered as a collapsed "Show reasoning" toggle under the reply. Small local models don't always follow the format perfectly -- if the tags are missing or truncated, the code falls back gracefully to using the raw response as the answer with no reasoning trace.
+
+**Off by default.** Asking the model to write out a full reasoning trace before every answer roughly doubles output length, which is real, noticeable latency on a small model running locally on CPU -- not something worth paying on every "hi". With Deep think off, replies use a short, direct system prompt and a lower token cap (`max_tokens=400` vs `800`), so the fast path stays fast; Deep think is there for when you actually want the model to slow down and work through something carefully.
+
+### Tool Calling / MCP (e.g. Power BI)
+
+Iris can call tools exposed by any [MCP](https://modelcontextprotocol.io) server you configure -- a Power BI MCP server included, since Foundry Local's chat completions API supports standard OpenAI-style `tools`/`tool_calls` for models tagged with the `tools` task in `foundry model list` (`qwen2.5-1.5b` is one). `utils/mcp_manager.py` is generic: it doesn't know or care what server it's talking to, so any MCP server (Power BI, filesystem, a custom one) works the same way.
+
+**Setup:**
+1. Copy `mcp_servers.example.json` to `mcp_servers.json` (gitignored -- it may end up holding paths or credentials specific to your machine).
+2. Point it at an MCP server. Several Power BI MCP servers exist, e.g. [microsoft/powerbi-modeling-mcp](https://github.com/microsoft/powerbi-modeling-mcp) or [sulaiman013/powerbi-mcp](https://github.com/sulaiman013/powerbi-mcp) -- follow that server's own README for auth/setup, then point `command`/`args`/`env` at however it's launched (most run via `npx`):
+   ```json
+   {
+     "mcpServers": {
+       "powerbi": {
+         "command": "npx",
+         "args": ["-y", "@microsoft/powerbi-modeling-mcp"],
+         "env": { "POWER_BI_...": "..." }
+       }
+     }
+   }
+   ```
+3. Restart the app. On startup it connects to every configured server in the background (over stdio) and lists their tools; this never blocks a request -- a chat that arrives before a server finishes connecting just proceeds without tools for that one turn.
+
+**How it works end to end:** each MCP server's tools are exposed to Foundry Local as OpenAI-format function definitions (tool names prefixed `servername__toolname` to avoid collisions across servers). When the model responds with a tool call, `app.py`'s loop in `/chat` executes it via the right MCP server, feeds the result back as a `tool` message, and asks the model to continue -- repeating up to `MAX_TOOL_ROUNDS` (4) times before giving up, so a model stuck in a call loop can't hang a request forever.
+
+**Zero cost when unused.** With no `mcp_servers.json`, `get_openai_tools()` returns `[]` and no `tools` parameter is even sent to Foundry Local -- behavior and latency are identical to not having this feature at all. Small local models are also not always reliable at deciding when/how to call tools -- expect to iterate on tool names/descriptions if calls aren't happening when you'd expect.
 
 ### Troubleshooting
 
@@ -153,9 +181,11 @@ User Input (Text/Voice) --> Speech Recognition (if voice)
        |                                          ^
        v                                          |
 [Foundry Local Language Model] <----------- [ChromaDB Store]
-       |
-       v
-[<thinking> / <answer> split]
+       |                     \
+       |                      \--(tool_calls)--> [MCP Servers, e.g. Power BI] --+
+       |                                                                        |
+       v <----------------------------------------------------------------------+
+[<thinking> / <answer> split]  (Deep think only)
        |
        v
 Text-to-Speech Output (local WAV, played by the browser)
@@ -165,7 +195,8 @@ Key Component Interactions:
 1. User input is processed through text or voice channels
 2. Speech input is transcribed using Whisper
 3. The session's actual chat history is replayed to the model verbatim (not semantic search -- see Conversation Memory above); documents uploaded in that session are searched semantically for relevant chunks
-4. Foundry Local generates a response that reasons step by step before answering (see Chain-of-Thought Reasoning above)
-5. The final answer (reasoning stripped) is stored in ChromaDB for future turns
-6. The final answer is synthesized to a local audio file and played by the browser; the reasoning is shown separately as an optional, collapsed toggle
-7. Web search integration provides additional information (optional)
+4. If MCP servers are configured, their tools are offered to the model, which may call one or more before producing a final answer (see Tool Calling / MCP above)
+5. With Deep think on, the model reasons step by step before answering (see Chain-of-Thought Reasoning above); off by default for responsiveness
+6. The final answer (reasoning stripped) is stored in ChromaDB for future turns
+7. The final answer is synthesized to a local audio file and played by the browser; the reasoning, if any, is shown separately as an optional, collapsed toggle
+8. Web search integration provides additional information (optional)

@@ -4,8 +4,10 @@ from utils.foundry_client import query_foundry, foundry_embed
 from utils.tts import synthesize_to_file, warm_up as warm_up_tts
 from utils.web_search import search_web  # optional for online use
 from utils.doc_parser import parse_document
+from utils import mcp_manager
 import os
 import re
+import json
 import uuid
 import datetime
 import threading
@@ -36,9 +38,20 @@ whisper_model = whisper.load_model("base")  # or "small", "medium", "large"
 # (which is what made the first reply's audio fall back to pyttsx3).
 threading.Thread(target=warm_up_tts, daemon=True).start()
 
-SYSTEM_PROMPT = (
-    "You are Iris, a helpful local AI assistant. Think through non-trivial "
-    "questions step by step before answering.\n\n"
+# Connect to any MCP servers configured in mcp_servers.json (e.g. a Power BI
+# MCP server) in the background. A no-op with zero cost if none are
+# configured -- see utils/mcp_manager.py.
+mcp_manager.start()
+
+# How many past user/assistant turns to feed back as conversation history.
+MAX_HISTORY_MESSAGES = 12
+
+# Bound on how many tool-call round trips a single reply can take, so a
+# model stuck calling tools in a loop can't hang a request forever.
+MAX_TOOL_ROUNDS = 4
+
+_COT_INSTRUCTIONS = (
+    "Think through non-trivial questions step by step before answering.\n\n"
     "Respond using exactly this format:\n"
     "<thinking>\n"
     "Your step-by-step reasoning here.\n"
@@ -50,8 +63,22 @@ SYSTEM_PROMPT = (
     "Always include both tags."
 )
 
-# How many past user/assistant turns to feed back as conversation history.
-MAX_HISTORY_MESSAGES = 12
+_TOOLS_INSTRUCTIONS = (
+    "You have access to tools. Call a tool when it would genuinely help "
+    "answer the user's question (e.g. it needs current or external data "
+    "you don't already know); otherwise just answer directly."
+)
+
+def build_system_prompt(tools_available, deep_think):
+    """Chain-of-thought is opt-in (deep_think) because it roughly doubles
+    output length on every single reply, which is real added latency on a
+    small local model -- not something to pay by default on every "hi"."""
+    parts = ["You are Iris, a helpful local AI assistant."]
+    if tools_available:
+        parts.append(_TOOLS_INSTRUCTIONS)
+    if deep_think:
+        parts.append(_COT_INSTRUCTIONS)
+    return "\n\n".join(parts)
 
 _THINKING_RE = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL | re.IGNORECASE)
 _ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
@@ -136,6 +163,7 @@ def chat():
     data = request.get_json()
     user_message = data['message']
     session_id = data.get('session_id', str(uuid.uuid4()))
+    deep_think = bool(data.get('deep_think'))
 
     thinking = None
     if user_message.lower().startswith("search:"):
@@ -144,8 +172,9 @@ def chat():
     else:
         history = get_conversation_history(session_id)
         doc_context = retrieve_document_context(user_message, session_id)
+        tools = mcp_manager.get_openai_tools()  # [] if none configured/connected
 
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": build_system_prompt(bool(tools), deep_think)}]
         if doc_context:
             messages.append({
                 "role": "system",
@@ -154,7 +183,35 @@ def chat():
         messages.extend(history)
         messages.append({"role": "user", "content": user_message})
 
-        raw_response = query_foundry(messages, max_tokens=800)
+        max_tokens = 800 if deep_think else 400
+        message = query_foundry(messages, max_tokens=max_tokens, tools=tools)
+
+        rounds = 0
+        while getattr(message, "tool_calls", None) and rounds < MAX_TOOL_ROUNDS:
+            messages.append({
+                "role": "assistant",
+                "content": message.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": tc.type,
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in message.tool_calls
+                ],
+            })
+            for tc in message.tool_calls:
+                try:
+                    arguments = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+                result_text = mcp_manager.call_tool(tc.function.name, arguments)
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result_text})
+
+            rounds += 1
+            message = query_foundry(messages, max_tokens=max_tokens, tools=tools)
+
+        raw_response = message.content or ""
         response, thinking = split_thinking(raw_response)
 
     save_to_memory("user", user_message, session_id)

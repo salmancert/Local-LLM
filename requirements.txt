@@ -15,3 +15,9 @@ sentence-transformers
 # files bundled in models/kokoro/ -- no PyTorch, no external model hub.
 kokoro-onnx
 soundfile
+
+# MCP client for tool calling (e.g. a Power BI MCP server) -- see
+# mcp_servers.example.json. Pinned to the 2.x line this app's code targets;
+# a future major bump could change the client API again (it already did
+# once, from the classic ClientSession/stdio_client pattern to `Client`).
+mcp>=2,<3

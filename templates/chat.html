@@ -279,6 +279,15 @@
             background-color: #a9a9a9;
         }
 
+        #deep-think-toggle {
+            background-color: #a9a9a9;
+            margin-left: 10px;
+        }
+
+        #deep-think-toggle.active {
+            background-color: #d68910;
+        }
+
         @media (max-width: 768px) {
             body {
                 padding: 10px;
@@ -335,6 +344,13 @@
             </svg>
             Unmuted
         </button>
+        <button id="deep-think-toggle" title="Slower, more careful step-by-step reasoning">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M12 2a7 7 0 0 0-4 12.74V17a2 2 0 0 0 2 2h4a2 2 0 0 0 2-2v-2.26A7 7 0 0 0 12 2z" fill="white"/>
+                <path d="M9 21h6v1H9z" fill="white"/>
+            </svg>
+            Deep think: off
+        </button>
         <span id="recording-status"></span>
     </div>
     <div id="upload-status"></div>
@@ -355,10 +371,27 @@
         // Username handling
         let username = localStorage.getItem("chat_username");
         
+        // Deep-think (chain-of-thought) setting -- off by default since it
+        // roughly doubles response time; the user opts in per-session.
+        let deepThink = localStorage.getItem("deep_think") === "true" || false;
+        const deepThinkBtn = document.getElementById("deep-think-toggle");
+
+        function updateDeepThinkButton() {
+            deepThinkBtn.textContent = deepThink ? "Deep think: on" : "Deep think: off";
+            deepThinkBtn.classList.toggle("active", deepThink);
+        }
+        updateDeepThinkButton();
+
+        document.getElementById("deep-think-toggle").addEventListener("click", function() {
+            deepThink = !deepThink;
+            localStorage.setItem("deep_think", deepThink);
+            updateDeepThinkButton();
+        });
+
         // Audio settings
         let audioMuted = localStorage.getItem("audio_muted") === "true" || false;
         const audioToggleBtn = document.getElementById("audio-toggle");
-        
+
         // Update audio toggle button state
         function updateAudioToggleButton() {
             if (audioMuted) {
@@ -592,7 +625,7 @@
             fetch("/chat", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ message, session_id: sessionId })
+                body: JSON.stringify({ message, session_id: sessionId, deep_think: deepThink })
             })
             .then(res => res.json())
             .then(data => {
@@ -745,7 +778,7 @@
                                 const chatRes = await fetch('/chat', {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ message: data.text, session_id: sessionId })
+                                    body: JSON.stringify({ message: data.text, session_id: sessionId, deep_think: deepThink })
                                 });
                                 
                                 const chatData = await chatRes.json();
