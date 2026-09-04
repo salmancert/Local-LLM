@@ -13,11 +13,13 @@ The assistant leverages local language models through [Microsoft Foundry Local](
 │   └── style.css        # CSS styling for the chat interface
 ├── templates/           # HTML templates
 │   └── chat.html       # Main chat interface template
+├── models/
+│   └── kokoro/           # Bundled Kokoro TTS model weights (see Text-to-Speech below)
 └── utils/              # Utility modules
     ├── doc_parser.py       # Document parsing functionality
     ├── embedding_store.py  # Standalone ChromaDB + sentence-transformers helper
     ├── foundry_client.py   # Client for local Foundry Local inference/embeddings
-    ├── tts.py               # Offline text-to-speech (pyttsx3 / chatterbox-tts)
+    ├── tts.py               # Offline text-to-speech (Kokoro / pyttsx3)
     └── web_search.py        # Optional web search functionality
 ```
 
@@ -70,10 +72,11 @@ All configuration is via environment variables; sensible local defaults are used
 | `FOUNDRY_EMBEDDING_MODEL` | `nomic-embed-text` | Foundry Local catalog alias used for embeddings |
 | `FOUNDRY_ENDPOINT` | *(auto-discovered)* | Overrides the endpoint instead of discovering it via the SDK (e.g. a remote Foundry Local instance) |
 | `FOUNDRY_API_KEY` | *(none)* | API key to send when `FOUNDRY_ENDPOINT` is set |
-| `TTS_ENGINE` | `auto` | `auto` (use Kokoro if installed, else pyttsx3), `kokoro` (natural voice, optional dependency), or `pyttsx3` (always available, skips Kokoro) |
+| `TTS_ENGINE` | `auto` | `auto` (use Kokoro if installed, else pyttsx3), `kokoro` (natural voice), or `pyttsx3` (always available, skips Kokoro) |
 | `TTS_VOICE` | `af_heart` | Kokoro voice name (see [voice list](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md)) |
-| `TTS_LANG_CODE` | `a` | Kokoro language code (`a`=American English, `b`=British English, etc. -- must match the chosen voice) |
-| `TTS_DEVICE` | *(auto)* | Device used by Kokoro (e.g. `cpu` or `cuda`); auto-selects if unset |
+| `TTS_LANG` | `en-us` | Kokoro language (e.g. `en-us`, `en-gb`, `fr-fr`, `ja`, `zh` -- must match the chosen voice) |
+| `KOKORO_MODEL_PATH` | `models/kokoro/kokoro-v1.0.int8.onnx` | Override the bundled Kokoro model file |
+| `KOKORO_VOICES_PATH` | `models/kokoro/voices-v1.0.bin` | Override the bundled Kokoro voices file |
 
 Make sure the model aliases you configure are actually available in your Foundry Local catalog (`foundry model list`); if an embedding call fails (e.g. the alias isn't available), the app logs a warning and continues without that memory/context lookup rather than crashing the chat request.
 
@@ -100,18 +103,14 @@ curl -X POST -F "audio=@your_recording.wav" http://localhost:8000/upload_audio
 
 Every `/chat` response is synthesized to a local WAV file and returned as `audio_url`, which the browser plays directly -- nothing is sent to a remote TTS service. Two engines are supported (see `utils/tts.py`):
 
-- **[Kokoro](https://huggingface.co/hexgrad/Kokoro-82M)** (used automatically when installed) -- an 82M-parameter neural TTS model that sounds substantially more natural than a classic OS voice, while still being small and fast enough to run in real time on CPU. It's an optional dependency because it pulls in PyTorch and requires the `espeak-ng` system package:
-  ```bash
-  pip install "kokoro>=0.9.4" soundfile
-  # Linux (Debian/Ubuntu):
-  sudo apt-get install espeak-ng
-  # macOS:
-  brew install espeak-ng
-  # Windows: download the espeak-ng installer from
-  # https://github.com/espeak-ng/espeak-ng/releases
-  ```
-  Once installed, no configuration is needed -- `TTS_ENGINE=auto` (the default) picks it up automatically. Pick a different voice/language with `TTS_VOICE` / `TTS_LANG_CODE` (see the table above).
-- **pyttsx3** (fallback) -- uses the OS's built-in voices. Robotic-sounding but lightweight, no model download, and always available, so it's what keeps voice replies working if Kokoro isn't installed or fails to load (e.g. `espeak-ng` missing).
+- **[Kokoro](https://huggingface.co/hexgrad/Kokoro-82M)** (default) -- an 82M-parameter neural TTS model that sounds substantially more natural than a classic OS voice, while still being small and fast enough to run in real time on CPU. It runs via [kokoro-onnx](https://github.com/thewh1teagle/kokoro-onnx) (onnxruntime -- no PyTorch) against the model files bundled directly in `models/kokoro/`:
+  - `kokoro-v1.0.int8.onnx` (~89 MB, int8-quantized)
+  - `voices-v1.0.bin` (~27 MB, all voices)
+
+  These are committed to the repo (both under GitHub's 100 MB per-file limit, so no Git LFS needed) precisely so **no network access is required at runtime** -- not even to GitHub or Hugging Face. That matters because Hugging Face is blocked on some networks/orgs (the original `kokoro` package downloads weights from `huggingface.co` on first use, which fails in that environment); `kokoro-onnx`'s upstream releases are hosted on GitHub instead, which is how these files were fetched, and once they're in your clone nothing needs to be fetched again.
+
+  `TTS_ENGINE=auto` (the default) uses Kokoro automatically -- no extra setup needed beyond `pip install -r requirements.txt`. Pick a different voice/language with `TTS_VOICE` / `TTS_LANG` (see the table above).
+- **pyttsx3** (fallback) -- uses the OS's built-in voices. Robotic-sounding but lightweight, no model files, and always available, so it's what keeps voice replies working if Kokoro fails to load for any reason (e.g. the model files are missing or `kokoro-onnx` isn't installed).
 
 If TTS fails entirely, the frontend falls back to the browser's built-in `speechSynthesis` API.
 
