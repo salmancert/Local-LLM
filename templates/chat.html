@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Linda Chatbot</title>
+    <title>Iris Chatbot</title>
     <style>
         :root {
             --primary-color: #2c6ecf;
@@ -278,13 +278,13 @@
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
                 <path d="M20 2H4C2.9 2 2 2.9 2 4V22L6 18H20C21.1 18 22 17.1 22 16V4C22 2.9 21.1 2 20 2Z" fill="#2c6ecf"/>
             </svg>
-            Chat with Linda
+            Chat with Iris
         </h2>
         <div id="user-display"></div>
     </header>
     <div id="chat-container">
         <!-- Chat messages will be added here -->
-        <div id="typing-indicator" style="display: none;">Linda is typing...</div>
+        <div id="typing-indicator" style="display: none;">Iris is typing...</div>
     </div>
     
     <div id="control-bar">
@@ -565,7 +565,7 @@
                 
                 sessionId = data.session_id || sessionId;
                 localStorage.setItem("chat_session_id", sessionId);
-                addMessage("Linda", data.response);
+                addMessage("Iris", data.response);
 
                 // Speak the response if audio is not muted
                 speakResponse(data.response, data.audio_url);
@@ -717,7 +717,7 @@
                                 // Make sure typing indicator is always hidden
                                 hideTypingIndicator();
                                 
-                                addMessage("Linda", chatData.response);
+                                addMessage("Iris", chatData.response);
 
                                 // Speak the response if audio is not muted
                                 speakResponse(chatData.response, chatData.audio_url);
@@ -762,8 +762,8 @@
         // Initialize with welcome message
         window.onload = function() {
             setTimeout(() => {
-                const welcomeText = "Hello! I'm Linda, your virtual assistant. How can I help you today?";
-                addMessage("Linda", welcomeText);
+                const welcomeText = "Hello! I'm Iris, your virtual assistant. How can I help you today?";
+                addMessage("Iris", welcomeText);
 
                 // Speak welcome message if audio is not muted
                 speakResponse(welcomeText, null);
