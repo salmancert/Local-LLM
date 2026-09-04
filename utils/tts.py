@@ -84,3 +84,27 @@ def synthesize_to_file(text: str, out_path: str) -> str:
 
     _synthesize_with_pyttsx3(text, out_path)
     return out_path
+
+
+def warm_up():
+    """Eagerly load Kokoro and run one throwaway synthesis so any one-time
+    cost (reading the ~90MB model file, building the onnxruntime session,
+    initializing the espeak-ng phonemizer backend) happens now, in the
+    background at startup, instead of during -- and slowing down or
+    tripping up -- a user's first chat request."""
+    if os.environ.get("TTS_ENGINE", "auto").lower() == "pyttsx3":
+        return
+
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        _synthesize_with_kokoro("Warming up.", tmp_path)
+        print("[kokoro warmed up]")
+    except Exception as e:
+        print(f"[kokoro warmup skipped: {e}]")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass

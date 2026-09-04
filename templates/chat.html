@@ -205,6 +205,28 @@
             margin-bottom: 4px;
         }
 
+        .thinking {
+            margin-top: 8px;
+            text-align: left;
+        }
+
+        .thinking summary {
+            cursor: pointer;
+            font-size: 12px;
+            color: var(--text-secondary);
+            user-select: none;
+        }
+
+        .thinking-content {
+            margin-top: 6px;
+            padding: 8px 10px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            background-color: rgba(0, 0, 0, 0.04);
+            border-radius: 4px;
+            white-space: pre-line;
+        }
+
         .timestamp {
             font-size: 11px;
             color: var(--text-secondary);
@@ -474,21 +496,21 @@
             return result.join('\n');
         }
 
-        function addMessage(sender, text, isUser = false) {
+        function addMessage(sender, text, isUser = false, thinking = null) {
             // Add message before the typing indicator
             const typingIndicator = document.getElementById("typing-indicator");
-            
+
             const messageContainer = document.createElement("div");
             messageContainer.className = "message " + (isUser ? "user" : "bot");
-            
+
             const senderElement = document.createElement("div");
             senderElement.className = "sender " + (isUser ? "sender-user" : "sender-assistant");
             senderElement.textContent = sender;
             messageContainer.appendChild(senderElement);
-            
+
             const msgContent = document.createElement("div");
             msgContent.className = "content";
-            
+
             // For assistant messages, try to detect and format lists
             if (!isUser) {
                 // Check if message appears to contain a list
@@ -500,9 +522,23 @@
             } else {
                 msgContent.textContent = text;
             }
-            
+
             messageContainer.appendChild(msgContent);
-            
+
+            // Chain-of-thought reasoning, collapsed by default
+            if (!isUser && thinking) {
+                const details = document.createElement("details");
+                details.className = "thinking";
+                const summary = document.createElement("summary");
+                summary.textContent = "Show reasoning";
+                details.appendChild(summary);
+                const reasoning = document.createElement("div");
+                reasoning.className = "thinking-content";
+                reasoning.textContent = thinking;
+                details.appendChild(reasoning);
+                messageContainer.appendChild(details);
+            }
+
             const timestamp = document.createElement("div");
             timestamp.className = "timestamp";
             timestamp.textContent = formatTime();
@@ -565,7 +601,7 @@
                 
                 sessionId = data.session_id || sessionId;
                 localStorage.setItem("chat_session_id", sessionId);
-                addMessage("Iris", data.response);
+                addMessage("Iris", data.response, false, data.thinking);
 
                 // Speak the response if audio is not muted
                 speakResponse(data.response, data.audio_url);
@@ -717,7 +753,7 @@
                                 // Make sure typing indicator is always hidden
                                 hideTypingIndicator();
                                 
-                                addMessage("Iris", chatData.response);
+                                addMessage("Iris", chatData.response, false, chatData.thinking);
 
                                 // Speak the response if audio is not muted
                                 speakResponse(chatData.response, chatData.audio_url);

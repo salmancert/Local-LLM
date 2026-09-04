@@ -16,7 +16,10 @@ from functools import lru_cache
 # an unpinned install would silently break this module.
 
 DEFAULT_CHAT_MODEL = os.environ.get("FOUNDRY_MODEL", "qwen2.5-1.5b")
-DEFAULT_EMBEDDING_MODEL = os.environ.get("FOUNDRY_EMBEDDING_MODEL", "nomic-embed-text")
+# "nomic-embed-text" (the previous default) is an Ollama model name and was
+# never in Foundry Local's catalog -- every embedding call failed. The
+# correct catalog alias, per Microsoft's own docs, is "qwen3-embedding-0.6b".
+DEFAULT_EMBEDDING_MODEL = os.environ.get("FOUNDRY_EMBEDDING_MODEL", "qwen3-embedding-0.6b")
 
 
 @lru_cache(maxsize=None)
@@ -49,14 +52,17 @@ def _get_client_and_model_id(alias):
     return client, model_id
 
 
-def query_foundry(prompt, model=None):
+def query_foundry(messages, model=None, max_tokens=None):
+    """messages: a list of {"role": "system"|"user"|"assistant", "content": str},
+    e.g. the running conversation so far plus the new user turn -- callers
+    are responsible for including whatever history the model should see."""
     alias = model or DEFAULT_CHAT_MODEL
     try:
         client, model_id = _get_client_and_model_id(alias)
-        response = client.chat.completions.create(
-            model=model_id,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        kwargs = {"model": model_id, "messages": messages}
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        response = client.chat.completions.create(**kwargs)
         return response.choices[0].message.content
     except Exception as e:
         return f"[Foundry connection error: {e}]"
