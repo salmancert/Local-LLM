@@ -70,8 +70,10 @@ All configuration is via environment variables; sensible local defaults are used
 | `FOUNDRY_EMBEDDING_MODEL` | `nomic-embed-text` | Foundry Local catalog alias used for embeddings |
 | `FOUNDRY_ENDPOINT` | *(auto-discovered)* | Overrides the endpoint instead of discovering it via the SDK (e.g. a remote Foundry Local instance) |
 | `FOUNDRY_API_KEY` | *(none)* | API key to send when `FOUNDRY_ENDPOINT` is set |
-| `TTS_ENGINE` | `pyttsx3` | `pyttsx3` (default, lightweight) or `chatterbox` (higher quality, heavier, optional dependency) |
-| `TTS_DEVICE` | `cpu` | Device used when `TTS_ENGINE=chatterbox` (e.g. `cpu` or `cuda`) |
+| `TTS_ENGINE` | `auto` | `auto` (use Kokoro if installed, else pyttsx3), `kokoro` (natural voice, optional dependency), or `pyttsx3` (always available, skips Kokoro) |
+| `TTS_VOICE` | `af_heart` | Kokoro voice name (see [voice list](https://huggingface.co/hexgrad/Kokoro-82M/blob/main/VOICES.md)) |
+| `TTS_LANG_CODE` | `a` | Kokoro language code (`a`=American English, `b`=British English, etc. -- must match the chosen voice) |
+| `TTS_DEVICE` | *(auto)* | Device used by Kokoro (e.g. `cpu` or `cuda`); auto-selects if unset |
 
 Make sure the model aliases you configure are actually available in your Foundry Local catalog (`foundry model list`); if an embedding call fails (e.g. the alias isn't available), the app logs a warning and continues without that memory/context lookup rather than crashing the chat request.
 
@@ -98,8 +100,18 @@ curl -X POST -F "audio=@your_recording.wav" http://localhost:8000/upload_audio
 
 Every `/chat` response is synthesized to a local WAV file and returned as `audio_url`, which the browser plays directly -- nothing is sent to a remote TTS service. Two engines are supported (see `utils/tts.py`):
 
-- **pyttsx3** (default) -- uses the OS's built-in voices, no model download, always available.
-- **chatterbox-tts** (optional) -- a local neural TTS model for higher quality voices. Install it explicitly (`pip install chatterbox-tts`, a heavier dependency that pulls in PyTorch) and set `TTS_ENGINE=chatterbox`. If it isn't installed, or synthesis fails, the app automatically falls back to pyttsx3.
+- **[Kokoro](https://huggingface.co/hexgrad/Kokoro-82M)** (used automatically when installed) -- an 82M-parameter neural TTS model that sounds substantially more natural than a classic OS voice, while still being small and fast enough to run in real time on CPU. It's an optional dependency because it pulls in PyTorch and requires the `espeak-ng` system package:
+  ```bash
+  pip install "kokoro>=0.9.4" soundfile
+  # Linux (Debian/Ubuntu):
+  sudo apt-get install espeak-ng
+  # macOS:
+  brew install espeak-ng
+  # Windows: download the espeak-ng installer from
+  # https://github.com/espeak-ng/espeak-ng/releases
+  ```
+  Once installed, no configuration is needed -- `TTS_ENGINE=auto` (the default) picks it up automatically. Pick a different voice/language with `TTS_VOICE` / `TTS_LANG_CODE` (see the table above).
+- **pyttsx3** (fallback) -- uses the OS's built-in voices. Robotic-sounding but lightweight, no model download, and always available, so it's what keeps voice replies working if Kokoro isn't installed or fails to load (e.g. `espeak-ng` missing).
 
 If TTS fails entirely, the frontend falls back to the browser's built-in `speechSynthesis` API.
 

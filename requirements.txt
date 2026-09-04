@@ -11,6 +11,8 @@ openai
 foundry-local-sdk==0.5.1
 sentence-transformers
 
-# Optional, heavier dependency for higher-quality local TTS
-# (set TTS_ENGINE=chatterbox to use it). See README.
-# chatterbox-tts
+# Optional, heavier dependency for natural-sounding local TTS (used
+# automatically when installed -- see README). Also requires the
+# espeak-ng system package.
+# kokoro>=0.9.4
+# soundfile
