@@ -1,15 +1,15 @@
-from flask import Flask, render_template, request, jsonify
-from utils.foundry_client import query_foundry
+from flask import Flask, render_template, request, jsonify, send_from_directory
+from werkzeug.utils import secure_filename
+from utils.foundry_client import query_foundry, foundry_embed
+from utils.tts import synthesize_to_file
 from utils.web_search import search_web  # optional for online use
 from utils.doc_parser import parse_document
 import os
 import uuid
 import datetime
-import requests
 from chromadb import PersistentClient
+from chromadb.config import Settings
 import whisper
-import pyttsx3
-import threading
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads/'
@@ -17,36 +17,25 @@ app.config['AUDIO_FOLDER'] = 'audio/'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['AUDIO_FOLDER'], exist_ok=True)
 
-# Initialize ChromaDB with persistent storage
-chroma_client = PersistentClient(path="chroma_store")
+# Initialize ChromaDB with persistent storage. anonymized_telemetry is
+# disabled so nothing leaves the machine -- this app is meant to run fully
+# offline/locally.
+chroma_client = PersistentClient(
+    path="chroma_store",
+    settings=Settings(anonymized_telemetry=False),
+)
 collection = chroma_client.get_or_create_collection("chat_memory")
 
 # Initialize Whisper model
 whisper_model = whisper.load_model("base")  # or "small", "medium", "large"
 
-# Initialize offline TTS
-tts_engine = pyttsx3.init()
-
-def foundry_embed(text):
-    # TODO: The user may need to update the endpoint and API key.
-    url = os.environ.get("FOUNDRY_ENDPOINT", "http://localhost:8000/v1/embeddings")
-    api_key = os.environ.get("FOUNDRY_API_KEY", "")
-    embedding_model = os.environ.get("FOUNDRY_EMBEDDING_MODEL", "nomic-embed-text")
-
-    headers = {
-        "Content-Type": "application/json",
-    }
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    response = requests.post(url, headers=headers, json={
-        "model": embedding_model,
-        "input": text
-    })
-    return response.json()['data'][0]['embedding']
-
 def save_to_memory(role, text, session_id, response=None):
-    embedding = foundry_embed(text)
+    try:
+        embedding = foundry_embed(text)
+    except Exception as e:
+        print(f"[Foundry embedding error, skipping memory save: {e}]")
+        return
+
     doc_id = str(uuid.uuid4())
     timestamp = datetime.datetime.now().isoformat()
 
@@ -66,33 +55,15 @@ def save_to_memory(role, text, session_id, response=None):
     )
 
 def retrieve_context(query, top_k=5):
-    query_embedding = foundry_embed(query)
+    try:
+        query_embedding = foundry_embed(query)
+    except Exception as e:
+        print(f"[Foundry embedding error, skipping context retrieval: {e}]")
+        return ""
+
     results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
     return "\n".join(results["documents"][0]) if results["documents"] else ""
 
-def _speak(text):
-    try:
-        # Select a natural-sounding female voice
-        voices = tts_engine.getProperty('voices')
-        for voice in voices:
-            if 'female' in voice.name.lower() or 'zira' in voice.name.lower():
-                tts_engine.setProperty('voice', voice.id)
-                break
-        else:
-            tts_engine.setProperty('voice', voices[0].id)  # fallback
-
-        tts_engine.setProperty('rate', 170)
-        tts_engine.setProperty('volume', 1.0)
-
-        tts_engine.say(text)
-        tts_engine.runAndWait()
-    except RuntimeError as e:
-        print(f"TTS error: {e}")
-
-def speak_offline(text):
-    # Start a new thread to prevent blocking and loop issues
-    threading.Thread(target=_speak, args=(text,), daemon=True).start()
-    
 @app.route('/')
 def index():
     return render_template('chat.html')
@@ -114,16 +85,31 @@ def chat():
     save_to_memory("user", user_message, session_id, response)
     save_to_memory("assistant", response, session_id)
 
-    speak_offline(response)  # respond with TTS
+    # Synthesize the reply to a local audio file the browser can play.
+    # TTS runs fully offline (see utils/tts.py); if it fails for any
+    # reason, the frontend falls back to the browser's own speech synthesis.
+    audio_url = None
+    try:
+        audio_filename = f"{uuid.uuid4()}.wav"
+        audio_path = os.path.join(app.config['AUDIO_FOLDER'], audio_filename)
+        synthesize_to_file(response, audio_path)
+        audio_url = f"/audio/{audio_filename}"
+    except Exception as e:
+        print(f"[TTS error: {e}]")
 
-    return jsonify({"response": response, "session_id": session_id})
+    return jsonify({"response": response, "session_id": session_id, "audio_url": audio_url})
+
+@app.route('/audio/<path:filename>')
+def get_audio(filename):
+    return send_from_directory(app.config['AUDIO_FOLDER'], filename, mimetype="audio/wav")
 
 @app.route('/upload', methods=['POST'])
 def upload_doc():
     file = request.files['file']
     session_id = request.form.get("session_id", str(uuid.uuid4()))
 
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
+    filename = secure_filename(file.filename)
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
 
     content = parse_document(filepath)
@@ -141,7 +127,8 @@ def upload_audio():
     audio = request.files['audio']
     session_id = request.form.get("session_id", str(uuid.uuid4()))
 
-    filepath = os.path.join(app.config['AUDIO_FOLDER'], audio.filename)
+    filename = secure_filename(audio.filename) or f"{uuid.uuid4()}.webm"
+    filepath = os.path.join(app.config['AUDIO_FOLDER'], filename)
     audio.save(filepath)
 
     result = whisper_model.transcribe(filepath)

@@ -1,38 +1,69 @@
-import requests
 import os
+from functools import lru_cache
 
-def query_foundry(prompt, model="qwen2.5-1.5b"):
-    # TODO: The user may need to update the endpoint and API key.
-    url = os.environ.get("FOUNDRY_ENDPOINT", "http://localhost:8000/v1/chat/completions")
-    api_key = os.environ.get("FOUNDRY_API_KEY", "")
+# Foundry Local does not listen on a fixed, well-known port -- the actual
+# service is started on demand and its port is chosen at runtime. The
+# previous implementation hardcoded "http://localhost:8000/...", which
+# both pointed nowhere (Foundry Local was never listening there) and
+# collided with this app's own Flask port (also 8000). Instead we use the
+# `foundry-local-sdk` package (module `foundry_local`) to start/attach to
+# the local Foundry service and discover its real endpoint at runtime via
+# `FoundryLocalManager(alias).endpoint`.
+#
+# NOTE: foundry-local-sdk is pinned to 0.5.1 in requirements.txt. Versions
+# >=1.0.0 replaced this thin OpenAI-compatible REST client with an
+# unrelated in-process native binding API (no `.endpoint`/`.api_key`), so
+# an unpinned install would silently break this module.
 
-    headers = {
-        "Content-Type": "application/json",
-    }
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+DEFAULT_CHAT_MODEL = os.environ.get("FOUNDRY_MODEL", "qwen2.5-1.5b")
+DEFAULT_EMBEDDING_MODEL = os.environ.get("FOUNDRY_EMBEDDING_MODEL", "nomic-embed-text")
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "stream": False
-    }
 
+@lru_cache(maxsize=None)
+def _get_manager(alias):
+    from foundry_local import FoundryLocalManager
+    # Starts the Foundry Local service (if needed) and downloads/loads
+    # `alias` -- may take a while on first use.
+    return FoundryLocalManager(alias)
+
+
+@lru_cache(maxsize=None)
+def _get_client_and_model_id(alias):
+    import openai
+
+    # Explicit override for advanced setups (e.g. a remote Foundry Local
+    # instance, or a manually chosen port).
+    endpoint = os.environ.get("FOUNDRY_ENDPOINT")
+    if endpoint:
+        api_key = os.environ.get("FOUNDRY_API_KEY", "") or "not-needed"
+        return openai.OpenAI(base_url=endpoint, api_key=api_key), alias
+
+    manager = _get_manager(alias)
+    client = openai.OpenAI(
+        base_url=manager.endpoint,
+        api_key=manager.api_key or "not-needed",
+    )
+    # The catalog alias (e.g. "qwen2.5-1.5b") isn't itself a valid model id
+    # for the inference API -- resolve it to the concrete loaded model id.
+    model_id = manager.get_model_info(alias).id
+    return client, model_id
+
+
+def query_foundry(prompt, model=None):
+    alias = model or DEFAULT_CHAT_MODEL
     try:
-        response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        response_json = response.json()
-
-        if "choices" not in response_json or len(response_json["choices"]) == 0:
-            return f"[Foundry unexpected response: {response_json}]"
-
-        return response_json["choices"][0]["message"]["content"]
-
-    except requests.exceptions.RequestException as e:
-        return f"[Foundry connection error: {e}]"
-    except ValueError:
-        return "[Foundry returned non-JSON response]"
+        client, model_id = _get_client_and_model_id(alias)
+        response = client.chat.completions.create(
+            model=model_id,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message.content
     except Exception as e:
-        return f"[Unexpected error from Foundry: {e}]"
+        return f"[Foundry connection error: {e}]"
+
+
+def foundry_embed(text, model=None):
+    alias = model or DEFAULT_EMBEDDING_MODEL
+    client, model_id = _get_client_and_model_id(alias)
+    response = client.embeddings.create(model=model_id, input=text)
+    return response.data[0].embedding

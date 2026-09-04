@@ -1,9 +1,16 @@
 flask
-fitz
+PyMuPDF
 requests
-frontend
-tools
 chromadb
 openai-whisper
 pyttsx3
 waitress
+openai
+# Pinned: 1.0.0+ replaced this thin OpenAI-compatible REST client with an
+# unrelated in-process native-binding API (no .endpoint/.api_key).
+foundry-local-sdk==0.5.1
+sentence-transformers
+
+# Optional, heavier dependency for higher-quality local TTS
+# (set TTS_ENGINE=chatterbox to use it). See README.
+# chatterbox-tts

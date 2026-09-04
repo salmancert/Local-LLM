@@ -365,6 +365,28 @@
         // Initialize audio toggle state
         updateAudioToggleButton();
 
+        // Speak a response using the server-generated local TTS audio
+        // when available, falling back to the browser's built-in speech
+        // synthesis otherwise.
+        function speakResponse(text, audioUrl) {
+            if (audioMuted) return;
+
+            if (audioUrl) {
+                const audio = new Audio(audioUrl);
+                audio.play().catch(err => console.error("Audio playback error:", err));
+                return;
+            }
+
+            if ('speechSynthesis' in window) {
+                const speech = new SpeechSynthesisUtterance(text);
+                speech.lang = 'en-US';
+                speech.onerror = function(event) {
+                    console.error("Speech synthesis error:", event);
+                };
+                window.speechSynthesis.speak(speech);
+            }
+        }
+
         // Try to get username from environment first
         fetch("/get_username")
             .then(res => res.json())
@@ -544,19 +566,9 @@
                 sessionId = data.session_id || sessionId;
                 localStorage.setItem("chat_session_id", sessionId);
                 addMessage("Linda", data.response);
-                
+
                 // Speak the response if audio is not muted
-                if (!audioMuted && 'speechSynthesis' in window) {
-                    const speech = new SpeechSynthesisUtterance(data.response);
-                    speech.lang = 'en-US';
-                    speech.onend = function() {
-                        // Optional: Add handling for speech ending
-                    };
-                    speech.onerror = function(event) {
-                        console.error("Speech synthesis error:", event);
-                    };
-                    window.speechSynthesis.speak(speech);
-                }
+                speakResponse(data.response, data.audio_url);
             })
             .catch(error => {
                 // Make sure typing indicator is hidden on error
@@ -706,19 +718,9 @@
                                 hideTypingIndicator();
                                 
                                 addMessage("Linda", chatData.response);
-                                
+
                                 // Speak the response if audio is not muted
-                                if (!audioMuted && 'speechSynthesis' in window) {
-                                    const speech = new SpeechSynthesisUtterance(chatData.response);
-                                    speech.lang = 'en-US';
-                                    speech.onend = function() {
-                                        // Optional: Add handling for speech ending
-                                    };
-                                    speech.onerror = function(event) {
-                                        console.error("Speech synthesis error:", event);
-                                    };
-                                    window.speechSynthesis.speak(speech);
-                                }
+                                speakResponse(chatData.response, chatData.audio_url);
                             } catch (err) {
                                 // Make sure typing indicator is hidden if there's an error
                                 hideTypingIndicator();
@@ -760,14 +762,11 @@
         // Initialize with welcome message
         window.onload = function() {
             setTimeout(() => {
-                addMessage("Linda", "Hello! I'm Linda, your virtual assistant. How can I help you today?");
-                
+                const welcomeText = "Hello! I'm Linda, your virtual assistant. How can I help you today?";
+                addMessage("Linda", welcomeText);
+
                 // Speak welcome message if audio is not muted
-                if (!audioMuted && 'speechSynthesis' in window) {
-                    const speech = new SpeechSynthesisUtterance("Hello! I'm Linda, your virtual assistant. How can I help you today?");
-                    speech.lang = 'en-US';
-                    window.speechSynthesis.speak(speech);
-                }
+                speakResponse(welcomeText, null);
             }, 500);
         }
     </script>

@@ -2,7 +2,7 @@
 
 This project implements a web-based conversational AI assistant that combines document understanding, voice interaction, and contextual memory. It provides a natural language interface for document querying, web search, and general conversation with both text and voice support.
 
-The assistant leverages local language models through Ollama, maintains conversation context using ChromaDB for semantic search, and supports voice interaction through offline text-to-speech and speech recognition capabilities. The system is designed to work primarily offline, making it suitable for environments with limited internet connectivity while still providing optional web search functionality.
+The assistant leverages local language models through [Microsoft Foundry Local](https://github.com/microsoft/Foundry-Local), maintains conversation context using ChromaDB for semantic search, and supports voice interaction through offline text-to-speech and speech recognition capabilities. The system is designed to run entirely offline, with telemetry disabled, making it suitable for environments with limited internet connectivity while still providing optional web search functionality.
 
 ## Repository Structure
 ```
@@ -14,22 +14,18 @@ The assistant leverages local language models through Ollama, maintains conversa
 ├── templates/           # HTML templates
 │   └── chat.html       # Main chat interface template
 └── utils/              # Utility modules
-    ├── doc_parser.py      # Document parsing functionality
-    ├── embedding_store.py # ChromaDB interaction for storing embeddings
-    ├── ollama_client.py  # Client for local Ollama API interaction
-    └── web_search.py     # Optional web search functionality
+    ├── doc_parser.py       # Document parsing functionality
+    ├── embedding_store.py  # Standalone ChromaDB + sentence-transformers helper
+    ├── foundry_client.py   # Client for local Foundry Local inference/embeddings
+    ├── tts.py               # Offline text-to-speech (pyttsx3 / chatterbox-tts)
+    └── web_search.py        # Optional web search functionality
 ```
 
 ## Usage Instructions
 ### Prerequisites
-- Python 3.8 or higher
-- Ollama installed locally
-- ChromaDB
-- Flask
-- Whisper (for speech recognition)
-- pyttsx3 (for text-to-speech)
-- sentence-transformers
-- PyMuPDF (for document parsing)
+- Python 3.10 or higher
+- [Foundry Local](https://github.com/microsoft/Foundry-Local) installed and on your `PATH`
+- Flask, ChromaDB, Whisper, pyttsx3, PyMuPDF (installed via `requirements.txt`)
 
 ### Installation
 
@@ -44,27 +40,40 @@ source venv/bin/activate  # Linux/MacOS
 venv\Scripts\activate     # Windows
 
 # Install required packages
-pip install flask chromadb whisper pyttsx3 sentence-transformers PyMuPDF requests waitress
+pip install -r requirements.txt
 
-# Install Ollama (if not already installed)
-# Follow instructions at: https://ollama.ai/download
+# Install Foundry Local (if not already installed)
+# Follow instructions at: https://github.com/microsoft/Foundry-Local#quickstart
 ```
 
 ### Quick Start
-1. Start the Ollama service:
-```bash
-ollama serve
-```
 
-2. Run the Flask application:
+Foundry Local does not need to be started manually -- `utils/foundry_client.py` starts/attaches to the local service automatically the first time a chat or embedding request is made, downloading the model on first use if necessary (this can take a while the first time).
+
+1. Run the Flask application:
 ```bash
 python app.py
 ```
 
-3. Open your web browser and navigate to:
+2. Open your web browser and navigate to:
 ```
 http://localhost:8000
 ```
+
+### Configuration
+
+All configuration is via environment variables; sensible local defaults are used if they're unset.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FOUNDRY_MODEL` | `qwen2.5-1.5b` | Foundry Local catalog alias used for chat completions |
+| `FOUNDRY_EMBEDDING_MODEL` | `nomic-embed-text` | Foundry Local catalog alias used for embeddings |
+| `FOUNDRY_ENDPOINT` | *(auto-discovered)* | Overrides the endpoint instead of discovering it via the SDK (e.g. a remote Foundry Local instance) |
+| `FOUNDRY_API_KEY` | *(none)* | API key to send when `FOUNDRY_ENDPOINT` is set |
+| `TTS_ENGINE` | `pyttsx3` | `pyttsx3` (default, lightweight) or `chatterbox` (higher quality, heavier, optional dependency) |
+| `TTS_DEVICE` | `cpu` | Device used when `TTS_ENGINE=chatterbox` (e.g. `cpu` or `cuda`) |
+
+Make sure the model aliases you configure are actually available in your Foundry Local catalog (`foundry model list`); if an embedding call fails (e.g. the alias isn't available), the app logs a warning and continues without that memory/context lookup rather than crashing the chat request.
 
 ### More Detailed Examples
 
@@ -85,13 +94,22 @@ curl -X POST -H "Content-Type: application/json" \
 curl -X POST -F "audio=@your_recording.wav" http://localhost:8000/upload_audio
 ```
 
+### Text-to-Speech
+
+Every `/chat` response is synthesized to a local WAV file and returned as `audio_url`, which the browser plays directly -- nothing is sent to a remote TTS service. Two engines are supported (see `utils/tts.py`):
+
+- **pyttsx3** (default) -- uses the OS's built-in voices, no model download, always available.
+- **chatterbox-tts** (optional) -- a local neural TTS model for higher quality voices. Install it explicitly (`pip install chatterbox-tts`, a heavier dependency that pulls in PyTorch) and set `TTS_ENGINE=chatterbox`. If it isn't installed, or synthesis fails, the app automatically falls back to pyttsx3.
+
+If TTS fails entirely, the frontend falls back to the browser's built-in `speechSynthesis` API.
+
 ### Troubleshooting
 
-1. Ollama Connection Issues
-- Error: "Connection refused to localhost:11434"
-  - Verify Ollama is running: `ps aux | grep ollama`
-  - Check Ollama logs: `ollama logs`
-  - Restart Ollama: `ollama restart`
+1. Foundry Local Connection Issues
+- Error: "[Foundry connection error: ...]" in the chat response
+  - Verify Foundry Local is installed and on your `PATH`
+  - Verify the model alias in `FOUNDRY_MODEL` / `FOUNDRY_EMBEDDING_MODEL` exists in your catalog: `foundry model list`
+  - The first request for a given model can be slow while it downloads -- check server logs for download progress
 
 2. ChromaDB Issues
 - Error: "Collection not found"
@@ -115,20 +133,20 @@ User Input (Text/Voice) --> Speech Recognition (if voice)
 [Context Retrieval] <--> [ChromaDB Store]
        |
        v
-[Ollama Language Model]
+[Foundry Local Language Model]
        |
        v
 [Response Generation]
        |
        v
-Text-to-Speech Output
+Text-to-Speech Output (local WAV, played by the browser)
 ```
 
 Key Component Interactions:
 1. User input is processed through text or voice channels
 2. Speech input is transcribed using Whisper
-3. ChromaDB retrieves relevant context using semantic search
-4. Ollama generates contextual responses
+3. ChromaDB retrieves relevant context using semantic search (telemetry disabled)
+4. Foundry Local generates contextual responses
 5. Responses are stored in ChromaDB for future context
-6. Text-to-speech converts responses to audio when needed
+6. The response is synthesized to a local audio file and played by the browser
 7. Web search integration provides additional information (optional)
