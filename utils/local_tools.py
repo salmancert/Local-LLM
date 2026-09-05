@@ -1,8 +1,9 @@
 """Native, always-local tools for common productivity tasks: spreadsheets,
-Word documents, PDFs, plain text files, web fetching, and (opt-in) email
-and shell commands. These run in-process -- no MCP server needed -- and
-are merged with any MCP tools (see utils/mcp_manager.py) into one `tools`
-list for Foundry Local.
+Word documents, PDFs, plain text files, file management, archives (zip/
+tar/rar), a calculator, the current date/time, web fetching, and (opt-in)
+email and shell commands. These run in-process -- no MCP server needed --
+and are merged with any MCP tools (see utils/mcp_manager.py) into one
+`tools` list for Foundry Local.
 
 Deeper OS integrations that need a real running application or an OAuth
 app registration (Outlook/Excel/Word desktop automation, full browser
@@ -27,13 +28,20 @@ uploaded documents) -- treat all of this the same as any other
 prompt-injection surface: these tools do what they're told, so the
 sandboxing above is the actual safety boundary, not a suggestion.
 """
+import ast
 import csv
-import io
+import operator
 import os
 import re
 
 WORKSPACE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "workspace")
 os.makedirs(WORKSPACE_DIR, exist_ok=True)
+
+try:
+    import rarfile as _rarfile_probe  # noqa: F401 -- just checking availability
+    _RARFILE_AVAILABLE = True
+except ImportError:
+    _RARFILE_AVAILABLE = False
 
 MAX_READ_CHARS = 20000
 MAX_FETCH_CHARS = 8000
@@ -93,6 +101,34 @@ def write_text_file(path, content):
     with open(full, "w", encoding="utf-8") as f:
         f.write(content)
     return f"Wrote {len(content)} characters to {path}"
+
+
+# --- File management -----------------------------------------------------
+
+def copy_file(source, destination):
+    import shutil
+    src = _resolve_path(source)
+    dst = _resolve_path(destination)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy2(src, dst)
+    return f"Copied {source} to {destination}"
+
+
+def move_file(source, destination):
+    import shutil
+    src = _resolve_path(source)
+    dst = _resolve_path(destination)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.move(src, dst)
+    return f"Moved {source} to {destination}"
+
+
+def delete_file(path):
+    full = _resolve_path(path)
+    if os.path.isdir(full):
+        raise ValueError("path is a directory -- delete_file only removes files")
+    os.remove(full)
+    return f"Deleted {path}"
 
 
 # --- PDF ---------------------------------------------------------------
@@ -214,6 +250,145 @@ def fetch_webpage(url):
         tag.decompose()
     text = " ".join(soup.get_text(separator=" ").split())
     return _truncate(text, MAX_FETCH_CHARS)
+
+
+# --- Archives (zip / tar / rar) -----------------------------------------
+
+def _iter_files_for_archive(paths):
+    """Yield (real_filesystem_path, archive_member_name) pairs for a list
+    of workspace-relative paths, expanding any directories recursively."""
+    for p in paths:
+        resolved = _resolve_path(p)
+        if os.path.isdir(resolved):
+            for root, _dirs, filenames in os.walk(resolved):
+                for name in filenames:
+                    full_file = os.path.join(root, name)
+                    arcname = os.path.relpath(full_file, WORKSPACE_DIR)
+                    yield full_file, arcname
+        else:
+            yield resolved, p
+
+
+def _check_no_archive_escape(names, dest_dir):
+    """Guard against "zip-slip": an archive member whose name (e.g.
+    '../../etc/cron.d/x' or an absolute path) would land outside the
+    intended destination once extracted. Both zipfile and tarfile will
+    happily write wherever a malicious member name points unless the
+    caller checks first -- so we check first."""
+    dest_real = os.path.realpath(dest_dir)
+    for name in names:
+        target = os.path.realpath(os.path.join(dest_dir, name))
+        if target != dest_real and not target.startswith(dest_real + os.sep):
+            raise ValueError(f"archive member '{name}' would extract outside the destination -- refusing to extract")
+
+
+def create_zip_archive(path, files):
+    import zipfile
+    full = _resolve_path(path)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    count = 0
+    with zipfile.ZipFile(full, "w", zipfile.ZIP_DEFLATED) as zf:
+        for full_file, arcname in _iter_files_for_archive(files):
+            zf.write(full_file, arcname=arcname)
+            count += 1
+    return f"Created {path} with {count} file(s)"
+
+
+def extract_zip_archive(path, destination=""):
+    import zipfile
+    full = _resolve_path(path)
+    dest_dir = _resolve_path(destination) if destination else WORKSPACE_DIR
+    os.makedirs(dest_dir, exist_ok=True)
+    with zipfile.ZipFile(full, "r") as zf:
+        names = zf.namelist()
+        _check_no_archive_escape(names, dest_dir)
+        zf.extractall(dest_dir)
+    return f"Extracted {len(names)} file(s) from {path} to {destination or '.'}"
+
+
+def create_tar_archive(path, files):
+    import tarfile
+    full = _resolve_path(path)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    if full.endswith((".tar.gz", ".tgz")):
+        mode = "w:gz"
+    elif full.endswith((".tar.bz2", ".tbz2")):
+        mode = "w:bz2"
+    else:
+        mode = "w"
+    count = 0
+    with tarfile.open(full, mode) as tf:
+        for full_file, arcname in _iter_files_for_archive(files):
+            tf.add(full_file, arcname=arcname)
+            count += 1
+    return f"Created {path} with {count} file(s)"
+
+
+def extract_tar_archive(path, destination=""):
+    import tarfile
+    full = _resolve_path(path)
+    dest_dir = _resolve_path(destination) if destination else WORKSPACE_DIR
+    os.makedirs(dest_dir, exist_ok=True)
+    with tarfile.open(full, "r:*") as tf:
+        members = tf.getmembers()
+        _check_no_archive_escape([m.name for m in members], dest_dir)
+        tf.extractall(dest_dir, members=members)
+    return f"Extracted {len(members)} file(s) from {path} to {destination or '.'}"
+
+
+def extract_rar_archive(path, destination=""):
+    # RAR is a proprietary format with no free encoder, so only extraction
+    # is offered (no create_rar_archive). Needs the `rarfile` package AND
+    # a system unrar/unar/bsdtar binary on PATH to actually decompress --
+    # rarfile is just a wrapper around one of those.
+    import rarfile
+    full = _resolve_path(path)
+    dest_dir = _resolve_path(destination) if destination else WORKSPACE_DIR
+    os.makedirs(dest_dir, exist_ok=True)
+    with rarfile.RarFile(full) as rf:
+        names = rf.namelist()
+        _check_no_archive_escape(names, dest_dir)
+        rf.extractall(dest_dir)
+    return f"Extracted {len(names)} file(s) from {path} to {destination or '.'}"
+
+
+# --- Utility: calculator, current date/time ------------------------------
+
+_SAFE_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def _eval_arithmetic_node(node):
+    """Evaluate one node of an arithmetic-only AST. Deliberately not
+    `eval()`: this whitelist accepts numeric literals and +-*/%** only --
+    no names, no calls, no attribute/subscript access -- so it can't be
+    used to run arbitrary code no matter what expression an LLM passes in."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPERATORS:
+        return _SAFE_OPERATORS[type(node.op)](_eval_arithmetic_node(node.left), _eval_arithmetic_node(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_OPERATORS:
+        return _SAFE_OPERATORS[type(node.op)](_eval_arithmetic_node(node.operand))
+    raise ValueError("only numbers and + - * / // % ** are allowed")
+
+
+def calculate(expression):
+    tree = ast.parse(expression, mode="eval")
+    return str(_eval_arithmetic_node(tree.body))
+
+
+def get_current_datetime():
+    import datetime
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S %A")
 
 
 # --- Email (opt-in: only offered if SMTP_* is configured) --------------
@@ -398,7 +573,145 @@ _STATIC_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "local__copy_file",
+            "description": "Copy a file within the local workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "Source path relative to the workspace root"},
+                    "destination": {"type": "string", "description": "Destination path relative to the workspace root"},
+                },
+                "required": ["source", "destination"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "local__move_file",
+            "description": "Move or rename a file within the local workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "Source path relative to the workspace root"},
+                    "destination": {"type": "string", "description": "Destination path relative to the workspace root"},
+                },
+                "required": ["source", "destination"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "local__delete_file",
+            "description": "Delete a file (not a directory) in the local workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "File path relative to the workspace root"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "local__create_zip_archive",
+            "description": "Create a .zip archive in the local workspace from one or more files/folders.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Zip file path to create, relative to the workspace root"},
+                    "files": {"type": "array", "items": {"type": "string"}, "description": "Files or folders to include, relative to the workspace root"},
+                },
+                "required": ["path", "files"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "local__extract_zip_archive",
+            "description": "Extract a .zip archive in the local workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Zip file path relative to the workspace root"},
+                    "destination": {"type": "string", "description": "Folder to extract into, relative to the workspace root (optional; defaults to the workspace root)"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "local__create_tar_archive",
+            "description": "Create a .tar, .tar.gz/.tgz, or .tar.bz2 archive in the local workspace from one or more files/folders.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Archive path to create, relative to the workspace root -- extension picks the compression (.tar, .tar.gz, .tgz, .tar.bz2)"},
+                    "files": {"type": "array", "items": {"type": "string"}, "description": "Files or folders to include, relative to the workspace root"},
+                },
+                "required": ["path", "files"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "local__extract_tar_archive",
+            "description": "Extract a .tar, .tar.gz/.tgz, or .tar.bz2 archive in the local workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Archive path relative to the workspace root"},
+                    "destination": {"type": "string", "description": "Folder to extract into, relative to the workspace root (optional; defaults to the workspace root)"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "local__calculate",
+            "description": "Evaluate an arithmetic expression (+ - * / // % **) and return the result.",
+            "parameters": {
+                "type": "object",
+                "properties": {"expression": {"type": "string", "description": "e.g. '(12 + 8) * 3'"}},
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "local__get_current_datetime",
+            "description": "Get the current local date and time.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
+
+_RAR_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "local__extract_rar_archive",
+        "description": "Extract a .rar archive in the local workspace. (Extraction only -- RAR is a proprietary format with no free encoder, so there's no way to create one.)",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "RAR file path relative to the workspace root"},
+                "destination": {"type": "string", "description": "Folder to extract into, relative to the workspace root (optional; defaults to the workspace root)"},
+            },
+            "required": ["path"],
+        },
+    },
+}
 
 _EMAIL_TOOL = {
     "type": "function",
@@ -434,6 +747,9 @@ _HANDLERS = {
     "local__list_workspace_files": lambda a: list_workspace_files(a.get("subdirectory", "")),
     "local__read_text_file": lambda a: read_text_file(a["path"]),
     "local__write_text_file": lambda a: write_text_file(a["path"], a["content"]),
+    "local__copy_file": lambda a: copy_file(a["source"], a["destination"]),
+    "local__move_file": lambda a: move_file(a["source"], a["destination"]),
+    "local__delete_file": lambda a: delete_file(a["path"]),
     "local__read_pdf": lambda a: read_pdf(a["path"]),
     "local__create_pdf": lambda a: create_pdf(a["path"], a["text"]),
     "local__read_spreadsheet": lambda a: read_spreadsheet(a["path"], a.get("sheet_name")),
@@ -441,6 +757,13 @@ _HANDLERS = {
     "local__read_word_document": lambda a: read_word_document(a["path"]),
     "local__write_word_document": lambda a: write_word_document(a["path"], a["content"]),
     "local__fetch_webpage": lambda a: fetch_webpage(a["url"]),
+    "local__create_zip_archive": lambda a: create_zip_archive(a["path"], a["files"]),
+    "local__extract_zip_archive": lambda a: extract_zip_archive(a["path"], a.get("destination", "")),
+    "local__create_tar_archive": lambda a: create_tar_archive(a["path"], a["files"]),
+    "local__extract_tar_archive": lambda a: extract_tar_archive(a["path"], a.get("destination", "")),
+    "local__extract_rar_archive": lambda a: extract_rar_archive(a["path"], a.get("destination", "")),
+    "local__calculate": lambda a: calculate(a["expression"]),
+    "local__get_current_datetime": lambda a: get_current_datetime(),
     "local__send_email": lambda a: send_email(a["to"], a["subject"], a["body"]),
     "local__run_shell_command": lambda a: run_shell_command(a["command"]),
 }
@@ -448,6 +771,8 @@ _HANDLERS = {
 
 def get_tool_schemas():
     tools = list(_STATIC_TOOLS)
+    if _RARFILE_AVAILABLE:
+        tools.append(_RAR_TOOL)
     if _EMAIL_CONFIGURED:
         tools.append(_EMAIL_TOOL)
     if ENABLE_SHELL_TOOL:

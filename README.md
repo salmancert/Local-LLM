@@ -21,7 +21,7 @@ The assistant leverages local language models through [Microsoft Foundry Local](
     ├── doc_parser.py       # Document parsing functionality
     ├── embedding_store.py  # Standalone ChromaDB + sentence-transformers helper
     ├── foundry_client.py   # Client for local Foundry Local inference/embeddings
-    ├── local_tools.py       # Native tools: spreadsheets, Word, PDF, notepad, web fetch, email, shell
+    ├── local_tools.py       # Native tools: spreadsheets, Word, PDF, notepad, archives, web fetch, calc, email, shell
     ├── mcp_manager.py       # Generic MCP client -- connects configured tool servers
     ├── tts.py               # Offline text-to-speech (Kokoro / pyttsx3)
     └── web_search.py        # Optional web search functionality
@@ -72,7 +72,7 @@ All configuration is via environment variables; sensible local defaults are used
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FOUNDRY_MODEL` | `qwen2.5-1.5b` | Foundry Local catalog alias used for chat completions |
+| `FOUNDRY_MODEL` | `phi-4-mini` | Foundry Local catalog alias used for chat completions. 3.8B, a generation newer than the previous default (qwen2.5-1.5b) and built with native tool calling as a first-class capability -- worth it now that tool calling/MCP/Workforce all depend on the model reliably deciding when to call a tool. It's larger, so not literally faster in tokens/sec on identical hardware; "faster" here means staying CPU-practical rather than jumping to a 7B+ model. Override to trade back down for raw speed (`qwen2.5-0.5b`/`qwen2.5-1.5b`) or up for capability (`qwen2.5-7b`, `phi-4`) |
 | `FOUNDRY_EMBEDDING_MODEL` | `qwen3-embedding-0.6b` | Foundry Local catalog alias used for embeddings |
 | `FOUNDRY_ENDPOINT` | *(auto-discovered)* | Overrides the endpoint instead of discovering it via the SDK (e.g. a remote Foundry Local instance) |
 | `FOUNDRY_API_KEY` | *(none)* | API key to send when `FOUNDRY_ENDPOINT` is set |
@@ -133,7 +133,7 @@ Click **Deep think** in the control bar to have the model reason step by step in
 
 ### Tool Calling
 
-Iris can call tools -- Foundry Local's chat completions API supports standard OpenAI-style `tools`/`tool_calls` for models tagged with the `tools` task in `foundry model list` (`qwen2.5-1.5b` is one). Tools come from two places, merged into one list by `get_all_tools()` in `app.py`:
+Iris can call tools -- Foundry Local's chat completions API supports standard OpenAI-style `tools`/`tool_calls` for models tagged with the `tools` task in `foundry model list` (the default model, `phi-4-mini`, is one, and was picked partly for this). Tools come from two places, merged into one list by `get_all_tools()` in `app.py`:
 
 - **Native local tools** (`utils/local_tools.py`) -- always available, no setup, no external process. Run in-process against a sandboxed `workspace/` folder in the repo root.
 - **MCP servers** (`utils/mcp_manager.py`) -- anything you configure in `mcp_servers.json`, e.g. Power BI.
@@ -142,18 +142,24 @@ Iris can call tools -- Foundry Local's chat completions API supports standard Op
 
 Small local models are not always reliable at deciding when/how to call tools -- expect to iterate on tool names/descriptions if calls aren't happening when you'd expect, and expect the occasional malformed call (handled: JSON-parse failures fall back to `{}` arguments rather than crashing the request).
 
-#### Native tools: spreadsheets, Word, PDF, notepad, web browsing
+#### Native tools: spreadsheets, Word, PDF, notepad, archives, web browsing, and more
 
 | Tool | Does |
 |---|---|
 | `local__read_text_file` / `local__write_text_file` | Plain text files (Notepad-like) |
+| `local__copy_file` / `local__move_file` / `local__delete_file` | Basic file management |
 | `local__read_pdf` / `local__create_pdf` | Read a PDF's text; create a new PDF from text |
 | `local__read_spreadsheet` / `local__write_spreadsheet` | `.csv`, `.xlsx`, `.xlsm` -- read returns tab-separated rows, write takes rows of cell values |
 | `local__read_word_document` / `local__write_word_document` | `.docx` |
+| `local__create_zip_archive` / `local__extract_zip_archive` | `.zip`, files or whole folders |
+| `local__create_tar_archive` / `local__extract_tar_archive` | `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2` |
+| `local__extract_rar_archive` | `.rar` extraction only -- RAR is proprietary with no free encoder, so there's no create; only offered if the `rarfile` package is installed (also needs a system `unrar`/`unar` binary on `PATH` to actually decompress) |
+| `local__calculate` | Arithmetic (`+ - * / // % **`), evaluated by a whitelisted AST walk -- no `eval()`, so it can't be turned into code execution regardless of what expression the model passes |
+| `local__get_current_datetime` | The model doesn't otherwise reliably know today's date |
 | `local__fetch_webpage` | Fetch a URL, strip scripts/nav/styling, return readable text -- this is "web browsing": research and reading, not clicking/filling forms (see Playwright below for that) |
 | `local__list_workspace_files` | List what's in the workspace |
 
-**Everything above is sandboxed to `workspace/`** (created automatically, gitignored). Every path a tool touches is resolved and checked to stay inside it -- no `..` traversal, no absolute paths -- so a tool call can read or overwrite files there and nowhere else on your machine. This matters because tool calls are LLM-decided, and the model's context can include content from outside the conversation (a fetched web page, an MCP tool's output, an uploaded document) -- treat that the same as any other prompt-injection surface. The sandbox is the actual safety boundary here, not a suggestion to the model.
+**Everything file-related above is sandboxed to `workspace/`** (created automatically, gitignored). Every path a tool touches is resolved and checked to stay inside it -- no `..` traversal, no absolute paths -- so a tool call can read or overwrite files there and nowhere else on your machine. Archive extraction gets the same treatment against "zip-slip"/"tar-slip": every member's path is checked before extracting, since a crafted archive with a member named e.g. `../../.bashrc` would otherwise happily write outside the destination (confirmed this actually works as a real attack against `zipfile`/`tarfile` if you don't check first -- both extract wherever a member name points, no questions asked). All of this matters because tool calls are LLM-decided, and the model's context can include content from outside the conversation (a fetched web page, an MCP tool's output, an uploaded document, a downloaded archive) -- treat that the same as any other prompt-injection surface. The sandbox is the actual safety boundary here, not a suggestion to the model.
 
 Two more native tools exist but are **off unless you configure them**:
 
@@ -193,7 +199,7 @@ Click **Workforce** to have complex requests handled by a small team of agents i
 
 The reply includes a `breakdown` (list of `{subtask, result}`) whenever real decomposition happened, rendered as a collapsed "Show task breakdown" toggle under the reply, so you can see what each worker actually did.
 
-**Honest caveats:** this is several sequential-or-parallel LLM calls per request (1 plan + N workers + 1 synthesis), so it's slower than a normal reply -- that's why it's opt-in, same as Deep think. "Parallel" is best-effort: workers are dispatched concurrently from Python's side, but Foundry Local serves one model instance, so actual wall-clock speedup depends on whether it can service concurrent requests or just queues them -- either way the result is correct, just not necessarily faster than sequential on a single-GPU/CPU box. And a 1.5B local model's plans and worker outputs are meaningfully weaker than what you'd get from a frontier-model-backed Workforce -- expect to iterate on subtask quality, same as with tool calling.
+**Honest caveats:** this is several sequential-or-parallel LLM calls per request (1 plan + N workers + 1 synthesis), so it's slower than a normal reply -- that's why it's opt-in, same as Deep think. "Parallel" is best-effort: workers are dispatched concurrently from Python's side, but Foundry Local serves one model instance, so actual wall-clock speedup depends on whether it can service concurrent requests or just queues them -- either way the result is correct, just not necessarily faster than sequential on a single-GPU/CPU box. And a small local model's plans and worker outputs are meaningfully weaker than what you'd get from a frontier-model-backed Workforce -- expect to iterate on subtask quality, same as with tool calling.
 
 ### Troubleshooting
 

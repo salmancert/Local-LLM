@@ -16,7 +16,20 @@ from types import SimpleNamespace
 # unrelated in-process native binding API (no `.endpoint`/`.api_key`), so
 # an unpinned install would silently break this module.
 
-DEFAULT_CHAT_MODEL = os.environ.get("FOUNDRY_MODEL", "qwen2.5-1.5b")
+# phi-4-mini (3.8B) over the previous default qwen2.5-1.5b (1.5B): a
+# generation newer, meaningfully stronger per Microsoft's own benchmarks
+# (reasoning/math/code), and specifically built with native function/tool
+# calling as a first-class capability -- which matters a lot here now that
+# tool calling, MCP, and Workforce all depend on the model reliably
+# deciding when and how to call a tool. It's larger, so it is not faster
+# in raw tokens/sec on identical hardware than 1.5B -- "faster" here means
+# staying in the small/CPU-practical tier of its generation (Microsoft's
+# own "lightweight footprint" positioning) rather than jumping to a 7B+
+# model, and Foundry Local still auto-selects the fastest available
+# hardware variant (CPU/GPU/NPU) for whichever alias is requested.
+# Override with FOUNDRY_MODEL if you'd rather trade capability for raw
+# speed (qwen2.5-0.5b/1.5b) or capability for size (qwen2.5-7b, phi-4).
+DEFAULT_CHAT_MODEL = os.environ.get("FOUNDRY_MODEL", "phi-4-mini")
 # "nomic-embed-text" (the previous default) is an Ollama model name and was
 # never in Foundry Local's catalog -- every embedding call failed. The
 # correct catalog alias, per Microsoft's own docs, is "qwen3-embedding-0.6b".

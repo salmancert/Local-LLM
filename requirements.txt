@@ -23,7 +23,15 @@ soundfile
 mcp>=2,<3
 
 # Native local tools (utils/local_tools.py): spreadsheets, Word documents,
-# and web page text extraction. PDF reuses PyMuPDF above.
+# and web page text extraction. PDF reuses PyMuPDF above. zip/tar archive
+# support is stdlib (zipfile/tarfile), no extra package needed.
 openpyxl
 python-docx
 beautifulsoup4
+
+# RAR extraction (utils/local_tools.py). Also requires a system unrar/unar
+# binary on PATH to actually decompress -- rarfile just wraps one of those
+# (RAR is proprietary; there's no free encoder, so no create_rar_archive).
+# The extract_rar_archive tool is only offered to the model if this import
+# succeeds, so it's safe to remove this line if you don't need RAR support.
+rarfile
