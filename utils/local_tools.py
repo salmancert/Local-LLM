@@ -201,7 +201,7 @@ def write_spreadsheet(path, rows, sheet_name=None):
         wb = openpyxl.Workbook()
         ws = wb.active
         if sheet_name:
-            ws.title = sheet_name
+            ws.title = _sanitize_sheet_name(sheet_name)
         for row in rows:
             ws.append(row)
         wb.save(full)
@@ -209,6 +209,127 @@ def write_spreadsheet(path, rows, sheet_name=None):
         raise ValueError("path must end in .csv, .xlsx, or .xlsm")
 
     return f"Wrote {len(rows)} row(s) to {path}"
+
+
+_INVALID_SHEET_CHARS = re.compile(r"[\[\]:*?/\\]")
+
+
+def _sanitize_sheet_name(name):
+    name = _INVALID_SHEET_CHARS.sub("_", str(name)).strip() or "Sheet"
+    return name[:31]  # Excel's sheet-name length limit
+
+
+def list_spreadsheet_sheets(path):
+    import openpyxl
+    full = _resolve_path(path)
+    wb = openpyxl.load_workbook(full, read_only=True)
+    return "\n".join(wb.sheetnames)
+
+
+def write_spreadsheet_sheet(path, sheet_name, rows):
+    """Add or replace one sheet in an .xlsx/.xlsm workbook, preserving its
+    other sheets -- unlike write_spreadsheet, which always creates a
+    brand-new single-sheet file (so calling it repeatedly on the same
+    path just overwrites the previous sheet instead of accumulating
+    them). Creates the workbook if it doesn't exist yet."""
+    import openpyxl
+    full = _resolve_path(path)
+    ext = os.path.splitext(full)[1].lower()
+    if ext not in (".xlsx", ".xlsm"):
+        raise ValueError("write_spreadsheet_sheet only supports .xlsx/.xlsm -- a .csv file has no concept of multiple sheets")
+
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    if os.path.exists(full):
+        wb = openpyxl.load_workbook(full)
+    else:
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)  # drop the default blank sheet; we add our own named one below
+
+    sheet_name = _sanitize_sheet_name(sheet_name)
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+    ws = wb.create_sheet(title=sheet_name)
+    for row in rows:
+        ws.append(row)
+    wb.save(full)
+    return f"Wrote sheet '{sheet_name}' ({len(rows)} row(s)) to {path}"
+
+
+def split_spreadsheet_by_column(source_path, name_column, output_path=None, has_header=True):
+    """Read source_path (.csv/.xlsx/.xlsm), group its rows by the value in
+    `name_column` (a header name if has_header, else a 0-based column
+    index), and write one sheet per unique value into a single .xlsx
+    workbook. This is a deterministic, single-call alternative to asking
+    the model to loop write_spreadsheet_sheet once per group -- reliable
+    regardless of how well the model handles multi-step tool use."""
+    import openpyxl
+
+    full = _resolve_path(source_path)
+    ext = os.path.splitext(full)[1].lower()
+
+    if ext == ".csv":
+        with open(full, "r", encoding="utf-8", errors="replace", newline="") as f:
+            all_rows = list(csv.reader(f))
+    elif ext in (".xlsx", ".xlsm"):
+        wb_in = openpyxl.load_workbook(full, data_only=True)
+        all_rows = [list(row) for row in wb_in.active.iter_rows(values_only=True)]
+    else:
+        raise ValueError("source_path must end in .csv, .xlsx, or .xlsm")
+
+    if not all_rows:
+        raise ValueError("source spreadsheet is empty")
+
+    header = all_rows[0] if has_header else None
+    data_rows = all_rows[1:] if has_header else all_rows
+
+    if isinstance(name_column, str):
+        if not header:
+            raise ValueError("name_column was given as a header name, but has_header is false")
+        try:
+            col_index = header.index(name_column)
+        except ValueError:
+            raise ValueError(f"column '{name_column}' not found in header {header}")
+    else:
+        col_index = int(name_column)
+
+    groups = {}
+    for row in data_rows:
+        key = str(row[col_index]) if col_index < len(row) and row[col_index] is not None else ""
+        groups.setdefault(key, []).append(row)
+
+    if not output_path:
+        base, _ = os.path.splitext(source_path)
+        output_path = f"{base}_split.xlsx"
+    out_full = _resolve_path(output_path)
+    if not out_full.endswith((".xlsx", ".xlsm")):
+        raise ValueError("output_path must end in .xlsx or .xlsm -- only these formats hold multiple sheets in one file")
+
+    os.makedirs(os.path.dirname(out_full), exist_ok=True)
+    wb_out = openpyxl.Workbook()
+    wb_out.remove(wb_out.active)
+    used_names = set()
+    sheet_names = []
+    for name, rows in groups.items():
+        sheet_name = _sanitize_sheet_name(name)
+        # Two different raw values can sanitize to the same name (e.g.
+        # "A:B" and "A/B" both become "A_B") -- dedupe explicitly rather
+        # than relying on openpyxl's own auto-rename, so the name we
+        # report back always matches the sheet actually created.
+        base_name, suffix = sheet_name, 2
+        while sheet_name in used_names:
+            sheet_name = f"{base_name[:29]}_{suffix}"
+            suffix += 1
+        used_names.add(sheet_name)
+        sheet_names.append(sheet_name)
+
+        ws = wb_out.create_sheet(title=sheet_name)
+        if header:
+            ws.append(header)
+        for row in rows:
+            ws.append(row)
+    wb_out.save(out_full)
+
+    return f"Created {len(groups)} sheet(s) in {output_path}: {', '.join(sorted(sheet_names))}"
 
 
 # --- Word documents (.docx) --------------------------------------------
@@ -518,7 +639,7 @@ _STATIC_TOOLS = [
         "type": "function",
         "function": {
             "name": "local__write_spreadsheet",
-            "description": "Write rows of data to a new spreadsheet (.csv, .xlsx, or .xlsm) in the local workspace.",
+            "description": "Create a new spreadsheet (.csv, .xlsx, or .xlsm) with one sheet of data, in the local workspace. This always creates a fresh single-sheet file -- calling it again on the same path replaces the whole file. To build a workbook with multiple named sheets, use local__write_spreadsheet_sheet instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -531,6 +652,55 @@ _STATIC_TOOLS = [
                     "sheet_name": {"type": "string", "description": "Sheet name for .xlsx files (optional)"},
                 },
                 "required": ["path", "rows"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "local__write_spreadsheet_sheet",
+            "description": "Add or replace one sheet in an .xlsx/.xlsm workbook, keeping its other sheets intact. Creates the workbook if it doesn't exist. Use this to build up a workbook with multiple named sheets, e.g. calling it once per name.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Workbook path (.xlsx/.xlsm), relative to the workspace root"},
+                    "sheet_name": {"type": "string", "description": "Name of the sheet to add or replace"},
+                    "rows": {
+                        "type": "array",
+                        "description": "Rows of data; each row is an array of cell values",
+                        "items": {"type": "array", "items": {}},
+                    },
+                },
+                "required": ["path", "sheet_name", "rows"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "local__list_spreadsheet_sheets",
+            "description": "List the sheet names in an .xlsx/.xlsm workbook.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Workbook path relative to the workspace root"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "local__split_spreadsheet_by_column",
+            "description": "Split a spreadsheet into multiple sheets in one new workbook, one sheet per unique value in a chosen column (e.g. one sheet per person or category, each containing that group's rows). Does the whole split in one call -- more reliable than looping local__write_spreadsheet_sheet per value.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_path": {"type": "string", "description": "Source spreadsheet (.csv, .xlsx, .xlsm), relative to the workspace root"},
+                    "name_column": {"description": "Column to split by: the header name if has_header is true, otherwise a 0-based column index"},
+                    "output_path": {"type": "string", "description": "Output .xlsx path, relative to the workspace root (optional; defaults to '<source>_split.xlsx')"},
+                    "has_header": {"type": "boolean", "description": "Whether the first row is a header row (default true)"},
+                },
+                "required": ["source_path", "name_column"],
             },
         },
     },
@@ -754,6 +924,11 @@ _HANDLERS = {
     "local__create_pdf": lambda a: create_pdf(a["path"], a["text"]),
     "local__read_spreadsheet": lambda a: read_spreadsheet(a["path"], a.get("sheet_name")),
     "local__write_spreadsheet": lambda a: write_spreadsheet(a["path"], a["rows"], a.get("sheet_name")),
+    "local__write_spreadsheet_sheet": lambda a: write_spreadsheet_sheet(a["path"], a["sheet_name"], a["rows"]),
+    "local__list_spreadsheet_sheets": lambda a: list_spreadsheet_sheets(a["path"]),
+    "local__split_spreadsheet_by_column": lambda a: split_spreadsheet_by_column(
+        a["source_path"], a["name_column"], a.get("output_path"), a.get("has_header", True)
+    ),
     "local__read_word_document": lambda a: read_word_document(a["path"]),
     "local__write_word_document": lambda a: write_word_document(a["path"], a["content"]),
     "local__fetch_webpage": lambda a: fetch_webpage(a["url"]),

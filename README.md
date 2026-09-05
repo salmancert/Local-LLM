@@ -149,7 +149,9 @@ Small local models are not always reliable at deciding when/how to call tools --
 | `local__read_text_file` / `local__write_text_file` | Plain text files (Notepad-like) |
 | `local__copy_file` / `local__move_file` / `local__delete_file` | Basic file management |
 | `local__read_pdf` / `local__create_pdf` | Read a PDF's text; create a new PDF from text |
-| `local__read_spreadsheet` / `local__write_spreadsheet` | `.csv`, `.xlsx`, `.xlsm` -- read returns tab-separated rows, write takes rows of cell values |
+| `local__read_spreadsheet` / `local__write_spreadsheet` | `.csv`, `.xlsx`, `.xlsm` -- read returns tab-separated rows (optionally from one named sheet), write creates a fresh single-sheet file |
+| `local__write_spreadsheet_sheet` / `local__list_spreadsheet_sheets` | Add or replace one sheet in an `.xlsx` workbook without touching its others -- unlike `write_spreadsheet`, calls accumulate instead of overwriting the file each time |
+| `local__split_spreadsheet_by_column` | One call: split a spreadsheet into one sheet per unique value in a chosen column (e.g. "one sheet per name") -- e.g. a timesheet with a Name column becomes one workbook with an Alice sheet, a Bob sheet, etc. Groups deterministically in Python rather than asking the model to loop the call above once per name |
 | `local__read_word_document` / `local__write_word_document` | `.docx` |
 | `local__create_zip_archive` / `local__extract_zip_archive` | `.zip`, files or whole folders |
 | `local__create_tar_archive` / `local__extract_tar_archive` | `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2` |
