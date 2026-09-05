@@ -30,6 +30,7 @@ sandboxing above is the actual safety boundary, not a suggestion.
 """
 import ast
 import csv
+import json
 import operator
 import os
 import re
@@ -172,19 +173,119 @@ def create_pdf(path, text):
     return f"Wrote PDF with {page_count} page(s) to {path}"
 
 
-def highlight_spelling_errors(path, output_path=None):
-    """Find likely misspelled words in a PDF and highlight them directly
-    in a saved copy -- the "do it on its own" version of proofreading,
-    versus just describing typos back in chat. Uses PyMuPDF's per-word
-    text positions (get_text("words")) to know exactly where each word
-    sits on the page, and pyspellchecker (a local, offline dictionary --
-    no network call, ever) to decide whether it's a real word.
+# Grammar checking has no offline dictionary equivalent -- "their" vs
+# "there" is spelled fine either way, so catching it needs actual
+# language understanding. Rather than add a new heavy dependency (a real
+# grammar checker like LanguageTool needs a Java runtime and a ~200MB
+# download), this reuses Foundry Local -- the model this whole app is
+# already built around -- as a plain completion call, no tool-calling
+# involved. Findings are batched: all of a document's text goes into as
+# few prompts as possible (grouped under a size budget), not one call per
+# sentence/paragraph, for the same reason ingest_document_chunks() in
+# app.py batches embeddings -- N sequential local-model calls is a real,
+# measured latency multiplier, not a theoretical one.
+_GRAMMAR_BATCH_CHAR_BUDGET = 3000
+_MAX_GRAMMAR_BATCHES = 6  # bounds worst-case latency on a very long document
+_GRAMMAR_HIGHLIGHT_COLOR = (1, 0.2, 0.55)
+_SPELLING_HIGHLIGHT_COLOR = (1, 0.6, 0.2)
 
-    This is dictionary-based, not grammar/context-aware: it will miss
-    real-word errors ("there" for "their") and can flag genuine but
-    obscure proper nouns/technical terms it doesn't recognize -- exactly
-    the tradeoffs of any offline spellchecker, called out here rather
-    than implied to be more than it is."""
+_GRAMMAR_SYSTEM_PROMPT = (
+    "You are a careful proofreader. The user message contains one or more "
+    "pages of a document, each preceded by a [[page N]] marker. Find real "
+    "grammar issues -- wrong word choice (e.g. \"their\" vs \"there\" vs "
+    "\"they're\"), subject-verb agreement, verb tense, missing/wrong "
+    "articles, and similar issues a spell-checker can't catch because "
+    "every word involved is spelled correctly on its own. Do NOT flag "
+    "misspelled words (that's handled separately) or stylistic preferences.\n\n"
+    "Respond with ONLY a JSON array (no prose, no markdown fences) of "
+    "objects: {\"page\": <the page number from its [[page N]] marker>, "
+    "\"error\": \"<the exact text with the issue, copied character-for-"
+    "character from the page -- this is used to locate it, so it must "
+    "match exactly>\", \"correction\": \"<corrected text>\", \"why\": "
+    "\"<short reason>\"}. If a page has no genuine grammar issues, don't "
+    "include it. If there are none anywhere, respond with []."
+)
+
+def _extract_json_array(raw):
+    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    if not match:
+        return []
+    try:
+        data = json.loads(match.group(0))
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+def _batch_pages_for_grammar_check(pages_text):
+    """Groups (page_number, text) pairs into as few batches as possible
+    under _GRAMMAR_BATCH_CHAR_BUDGET, capped at _MAX_GRAMMAR_BATCHES."""
+    batches = []
+    current, current_len = [], 0
+    for page_num, text in pages_text:
+        if not text.strip():
+            continue
+        if current and current_len + len(text) > _GRAMMAR_BATCH_CHAR_BUDGET:
+            batches.append(current)
+            current, current_len = [], 0
+            if len(batches) >= _MAX_GRAMMAR_BATCHES:
+                break
+        current.append((page_num, text))
+        current_len += len(text)
+    if current and len(batches) < _MAX_GRAMMAR_BATCHES:
+        batches.append(current)
+    return batches[:_MAX_GRAMMAR_BATCHES]
+
+def _find_grammar_issues(pages_text):
+    """Returns a list of {"page", "error", "correction", "why"} dicts.
+    Talks to Foundry Local directly (not through app.py's tool-calling
+    loop -- this is a plain completion, no tools offered). Fails soft:
+    any error (Foundry Local not reachable, a malformed response) just
+    means grammar checking is skipped for that batch, not that the whole
+    tool call fails -- spelling results are still useful on their own."""
+    from utils.foundry_client import query_foundry
+
+    batches = _batch_pages_for_grammar_check(pages_text)
+    non_empty_pages = sum(1 for _, text in pages_text if text.strip())
+    truncated = non_empty_pages > sum(len(b) for b in batches)
+
+    issues = []
+    for batch in batches:
+        prompt = "\n\n".join(f"[[page {num}]]\n{text}" for num, text in batch)
+        messages = [
+            {"role": "system", "content": _GRAMMAR_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            message = query_foundry(messages, max_tokens=800)
+        except Exception as e:
+            print(f"[proofread_pdf: grammar check failed for a batch: {e}]")
+            continue
+        for item in _extract_json_array(getattr(message, "content", "") or ""):
+            if isinstance(item, dict) and item.get("error") and item.get("page") is not None:
+                issues.append(item)
+    return issues, truncated
+
+def proofread_pdf(path, output_path=None, check_grammar=True):
+    """Proofread a PDF and highlight issues directly in a saved copy --
+    the "do it on its own" version of proofreading, versus just
+    describing issues back in chat. Two independent passes, each
+    highlighted in a different color so they're visually distinguishable:
+
+      - Spelling: PyMuPDF's per-word positions (get_text("words")) plus
+        pyspellchecker, a local offline dictionary (no network call,
+        ever). Catches misspelled words; can't catch a real word used
+        wrong, and can flag a genuine but obscure proper noun/term it
+        doesn't recognize.
+      - Grammar (check_grammar=True, the default): routed through
+        Foundry Local -- the local model this whole app already runs on
+        -- since "their" vs "there" is spelled fine either way and needs
+        actual language understanding, not a dictionary. Quality follows
+        directly from FOUNDRY_MODEL's own capability: a small model will
+        miss subtler issues and can occasionally flag something that
+        isn't really wrong. A finding is only highlighted if its exact
+        wording is found verbatim on the page (via search_for) -- if the
+        model paraphrases instead of quoting exactly, that finding is
+        silently dropped rather than highlighting the wrong text."""
     from spellchecker import SpellChecker
     import fitz  # PyMuPDF
 
@@ -192,7 +293,7 @@ def highlight_spelling_errors(path, output_path=None):
     doc = fitz.open(full)
     checker = SpellChecker()
 
-    flagged = []
+    spelling_flagged = []
     for page in doc:
         for x0, y0, x1, y1, word, *_ in page.get_text("words"):
             cleaned = re.sub(r"[^A-Za-z']", "", word)
@@ -201,29 +302,65 @@ def highlight_spelling_errors(path, output_path=None):
             if cleaned.lower() in checker:
                 continue
             annot = page.add_highlight_annot(fitz.Rect(x0, y0, x1, y1))
-            annot.set_colors(stroke=(1, 0.6, 0.2))
+            annot.set_colors(stroke=_SPELLING_HIGHLIGHT_COLOR)
             annot.update()
-            flagged.append((word, checker.correction(cleaned.lower())))
+            spelling_flagged.append((word, checker.correction(cleaned.lower())))
+
+    grammar_flagged = []
+    grammar_error = None
+    grammar_truncated = False
+    if check_grammar:
+        pages_text = [(i + 1, page.get_text("text")) for i, page in enumerate(doc)]
+        try:
+            issues, grammar_truncated = _find_grammar_issues(pages_text)
+        except Exception as e:
+            issues = []
+            grammar_error = str(e)
+        for issue in issues:
+            page_num = issue["page"]
+            if not isinstance(page_num, int) or not (1 <= page_num <= doc.page_count):
+                continue
+            page = doc[page_num - 1]
+            rects = page.search_for(issue["error"])
+            if not rects:
+                continue  # model didn't quote the page verbatim -- skip rather than mis-highlight
+            for rect in rects:
+                annot = page.add_highlight_annot(rect)
+                annot.set_colors(stroke=_GRAMMAR_HIGHLIGHT_COLOR)
+                annot.update()
+            grammar_flagged.append((issue["error"], issue.get("correction"), issue.get("why")))
 
     if output_path:
         out_full = _resolve_path(output_path)
     else:
         base, ext = os.path.splitext(path)
-        out_full = _resolve_path(f"{base}_spellchecked{ext or '.pdf'}")
+        out_full = _resolve_path(f"{base}_proofread{ext or '.pdf'}")
     os.makedirs(os.path.dirname(out_full), exist_ok=True)
     doc.save(out_full)
     doc.close()
 
     out_rel = os.path.relpath(out_full, WORKSPACE_DIR)
-    if not flagged:
-        return f"No likely spelling issues found. Saved an unmarked copy to {out_rel}."
-
-    preview_items = [f"'{w}'" + (f" (suggested: '{s}')" if s else "") for w, s in flagged[:30]]
-    more = f", and {len(flagged) - 30} more" if len(flagged) > 30 else ""
-    return (
-        f"Highlighted {len(flagged)} likely misspelled word(s) and saved the marked-up copy to "
-        f"{out_rel}: {'; '.join(preview_items)}{more}"
-    )
+    if not spelling_flagged and not grammar_flagged:
+        summary = f"No likely spelling or grammar issues found. Saved an unmarked copy to {out_rel}."
+    else:
+        parts = [f"Saved a marked-up copy to {out_rel}."]
+        if spelling_flagged:
+            preview = [f"'{w}'" + (f" (suggested: '{s}')" if s else "") for w, s in spelling_flagged[:20]]
+            more = f", and {len(spelling_flagged) - 20} more" if len(spelling_flagged) > 20 else ""
+            parts.append(f"Spelling ({len(spelling_flagged)}, highlighted orange): {'; '.join(preview)}{more}.")
+        if check_grammar:
+            if grammar_flagged:
+                preview = [f"'{e}' -> '{c}'" if c else f"'{e}'" for e, c, _why in grammar_flagged[:20]]
+                more = f", and {len(grammar_flagged) - 20} more" if len(grammar_flagged) > 20 else ""
+                parts.append(f"Grammar ({len(grammar_flagged)}, highlighted pink): {'; '.join(preview)}{more}.")
+            elif grammar_error:
+                parts.append(f"Grammar check skipped (Foundry Local error: {grammar_error}).")
+            else:
+                parts.append("No grammar issues found.")
+            if grammar_truncated:
+                parts.append(f"Grammar check covered roughly the first {_MAX_GRAMMAR_BATCHES * _GRAMMAR_BATCH_CHAR_BUDGET} characters of this document; the rest wasn't scanned.")
+        summary = " ".join(parts)
+    return summary
 
 
 # --- Spreadsheets (CSV / XLSX) -----------------------------------------
@@ -973,16 +1110,17 @@ _SHELL_TOOL = {
     },
 }
 
-_SPELLCHECK_TOOL = {
+_PROOFREAD_TOOL = {
     "type": "function",
     "function": {
-        "name": "local__highlight_spelling_errors",
-        "description": "Scan a PDF for likely misspelled words and save a copy with each one highlighted directly on the page. Offline dictionary-based spellcheck (no network call) -- catches typos/misspelled words, not grammar or wrong-word errors (e.g. 'there' vs 'their'), and can occasionally flag an obscure real word or proper noun it doesn't recognize.",
+        "name": "local__proofread_pdf",
+        "description": "Proofread a PDF for spelling AND grammar issues, saving a copy with each highlighted directly on the page (orange for spelling, pink for grammar). Spelling uses an offline dictionary (no network call, ever). Grammar -- wrong-word errors like 'there' vs 'their', subject-verb agreement, tense -- is checked by the local model (Foundry Local), since those need actual language understanding, not a dictionary; quality follows the configured model's own capability, and can be turned off for a faster spelling-only pass.",
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "PDF path relative to the workspace root"},
-                "output_path": {"type": "string", "description": "Where to save the highlighted copy, relative to the workspace root (optional; defaults to '<name>_spellchecked.pdf')"},
+                "output_path": {"type": "string", "description": "Where to save the highlighted copy, relative to the workspace root (optional; defaults to '<name>_proofread.pdf')"},
+                "check_grammar": {"type": "boolean", "description": "Also run the local-model grammar pass (default true). Set false for a faster spelling-only check."},
             },
             "required": ["path"],
         },
@@ -998,7 +1136,7 @@ _HANDLERS = {
     "local__delete_file": lambda a: delete_file(a["path"]),
     "local__read_pdf": lambda a: read_pdf(a["path"]),
     "local__create_pdf": lambda a: create_pdf(a["path"], a["text"]),
-    "local__highlight_spelling_errors": lambda a: highlight_spelling_errors(a["path"], a.get("output_path")),
+    "local__proofread_pdf": lambda a: proofread_pdf(a["path"], a.get("output_path"), a.get("check_grammar", True)),
     "local__read_spreadsheet": lambda a: read_spreadsheet(a["path"], a.get("sheet_name")),
     "local__write_spreadsheet": lambda a: write_spreadsheet(a["path"], a["rows"], a.get("sheet_name")),
     "local__write_spreadsheet_sheet": lambda a: write_spreadsheet_sheet(a["path"], a["sheet_name"], a["rows"]),
@@ -1026,7 +1164,7 @@ def get_tool_schemas():
     if _RARFILE_AVAILABLE:
         tools.append(_RAR_TOOL)
     if _SPELLCHECKER_AVAILABLE:
-        tools.append(_SPELLCHECK_TOOL)
+        tools.append(_PROOFREAD_TOOL)
     if _EMAIL_CONFIGURED:
         tools.append(_EMAIL_TOOL)
     if ENABLE_SHELL_TOOL:
