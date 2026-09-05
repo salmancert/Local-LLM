@@ -2,7 +2,7 @@
 
 This project implements a web-based conversational AI assistant that combines document understanding, voice interaction, and contextual memory. It provides a natural language interface for document querying, web search, and general conversation with both text and voice support.
 
-The assistant leverages local language models through [Microsoft Foundry Local](https://github.com/microsoft/Foundry-Local), maintains conversation context using ChromaDB for semantic search, and supports voice interaction through offline text-to-speech and speech recognition capabilities. The system is designed to run entirely offline, with telemetry disabled, making it suitable for environments with limited internet connectivity while still providing optional web search functionality.
+The assistant leverages local language models through [Microsoft Foundry Local](https://github.com/microsoft/Foundry-Local), maintains conversation context using ChromaDB for semantic search, and supports voice interaction through offline text-to-speech and speech recognition capabilities. It can also call tools (native local tools and MCP servers -- spreadsheets, documents, Power BI, browser automation, and more), decompose complex requests across a small team of agents (Workforce mode), remember facts across sessions in an optional knowledge graph (Cross-Session Memory), and hold a fully hands-free spoken conversation (Voice Mode). The system is designed to run entirely offline, with telemetry disabled, making it suitable for environments with limited internet connectivity while still providing optional web search functionality.
 
 ## Repository Structure
 ```
@@ -23,6 +23,7 @@ The assistant leverages local language models through [Microsoft Foundry Local](
     ├── foundry_client.py   # Client for local Foundry Local inference/embeddings
     ├── local_tools.py       # Native tools: spreadsheets, Word, PDF, notepad, archives, web fetch, calc, email, shell
     ├── mcp_manager.py       # Generic MCP client -- connects configured tool servers
+    ├── graph_memory.py      # Optional cross-session memory (Graphiti + embedded graph DB)
     ├── tts.py               # Offline text-to-speech (Kokoro / pyttsx3)
     └── web_search.py        # Optional web search functionality
 ```
@@ -84,6 +85,8 @@ All configuration is via environment variables; sensible local defaults are used
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` | *(unset)* | Enables the `local__send_email` tool when all of `SMTP_HOST`/`SMTP_USER`/`SMTP_PASSWORD` are set (`SMTP_PORT` defaults to `587`) |
 | `ENABLE_SHELL_TOOL` | `false` | Set `true` to enable `local__run_shell_command` -- read the Tool Calling section before turning this on |
 | `SHELL_TOOL_TIMEOUT` | `30` | Seconds before a shell command is killed, when the shell tool is enabled |
+| `ENABLE_GRAPH_MEMORY` | `false` | Set `true`/`1` to enable cross-session memory (see below). Requires `pip install "graphiti-core[falkordblite]"` and Python 3.12+ |
+| `GRAPH_MEMORY_DB_PATH` | `graph_memory.db` | Where the embedded graph database file is stored, when graph memory is enabled |
 
 Make sure the model aliases you configure are actually available in your Foundry Local catalog (`foundry model list`); if an embedding call fails (e.g. the alias isn't available), the app logs a warning and continues without that memory/context lookup rather than crashing the chat request.
 
@@ -206,6 +209,41 @@ Click **Workforce** to have complex requests handled by a small team of agents i
 The reply includes a `breakdown` (list of `{subtask, result}`) whenever real decomposition happened, rendered as a collapsed "Show task breakdown" toggle under the reply, so you can see what each worker actually did.
 
 **Honest caveats:** this is several sequential-or-parallel LLM calls per request (1 plan + N workers + 1 synthesis), so it's slower than a normal reply -- that's why it's opt-in, same as Deep think. "Parallel" is best-effort: workers are dispatched concurrently from Python's side, but Foundry Local serves one model instance, so actual wall-clock speedup depends on whether it can service concurrent requests or just queues them -- either way the result is correct, just not necessarily faster than sequential on a single-GPU/CPU box. And a small local model's plans and worker outputs are meaningfully weaker than what you'd get from a frontier-model-backed Workforce -- expect to iterate on subtask quality, same as with tool calling.
+
+### Cross-Session Memory (opt-in)
+
+The "Conversation Memory" and "Document Upload" features above are both scoped to one `session_id` -- ask Iris something in a new session (new browser/localStorage) and it has no idea what was discussed or uploaded before. `utils/graph_memory.py` adds a second, independent memory layer that persists across every session: it's what lets you upload a document or have a conversation today, and ask about it in a completely different session next week.
+
+**What it is and why this package specifically:** the user's ask here was for the same kind of "graphical retention of data for later auditing" that [MiroFish](https://github.com/666ghj/MiroFish) uses -- MiroFish's memory is Zep Cloud, a hosted product. [Graphiti](https://github.com/getzep/graphiti) (`graphiti-core`) is the open-source, Apache-2.0-licensed engine Zep itself is built on, and it works standalone against any OpenAI-compatible endpoint -- including Foundry Local -- so it was used directly instead of pulling in MiroFish (which is a whole standalone multi-agent simulation app built for a different problem, and AGPL-3.0 licensed) just to get at one dependency.
+
+Rather than embeddings-and-cosine-similarity (what the ChromaDB memory above does), Graphiti extracts **entities and relationships** from text via LLM calls and stores them as a temporal knowledge graph -- each fact is a timestamped edge (e.g. "Alice WORKS_AT Acme Corp", learned at time T), so it's not just "what was said" but a point-in-time-queryable record of what was true and when, which is the "auditing" angle: you can ask what was known as of a certain time, and facts that get contradicted later are marked invalid rather than silently overwritten.
+
+**Setup:**
+```bash
+pip install "graphiti-core[falkordblite]"   # requires Python 3.12+
+export ENABLE_GRAPH_MEMORY=1
+python app.py
+```
+That's it -- no separate database server to run. The `[falkordblite]` extra pulls in `redislite`, which runs an embedded FalkorDB (a Redis-module-based graph database) as a file (`graph_memory.db` by default, gitignored) rather than a process you manage yourself, consistent with this project's "no extra services" design. The LLM/embedding calls Graphiti needs for entity extraction are routed through the same Foundry Local endpoint as everything else (`utils/foundry_client.get_endpoint_config`) -- no separate API key, no cloud dependency. Graphiti's own telemetry (PostHog analytics) is disabled unconditionally (`GRAPHITI_TELEMETRY_ENABLED=false`, set at import time in `graph_memory.py`), matching this project's "everything stays local" rule for every other dependency.
+
+**How it's wired into `app.py`:** every `/chat` turn fires an `add_episode` call in the background with that turn's user message + reply, and every `/upload` fires one with the uploaded document's content -- both fire-and-forget (via `asyncio.run_coroutine_threadsafe` on a background event loop, mirroring `utils/mcp_manager.py`'s architecture), so extraction latency never delays a reply. On the read side, `/chat` also calls `graph_memory.search(user_message)` and, if it returns anything, adds it to the prompt as a "Facts remembered from earlier conversations" system message alongside (not replacing) the session-scoped document context.
+
+**Zero cost when unused.** `start()` checks `ENABLE_GRAPH_MEMORY` before importing `graphiti_core`/`redislite` at all -- with the env var unset (the default), no background thread starts, `search()` returns `""` immediately, and `add_episode()` is a no-op; nothing here changes behavior or requires the package to even be installed.
+
+**Honest caveats:**
+- Entity/relationship extraction is several LLM calls per episode -- noticeably heavier than the plain ChromaDB save, which is why every write is fire-and-forget and every read is timeout-bounded (`search(..., timeout=5)`, defaulting to no context rather than blocking a reply).
+- This was verified end-to-end in this project's dev sandbox using the embedded FalkorDB Lite backend and a scripted local server standing in for Foundry Local's chat/embeddings API (Foundry Local itself doesn't run in that Linux sandbox -- an existing limitation of this whole codebase, not something new here): episode extraction, temporal fact storage, and semantic search retrieval all confirmed working. It has **not** been run against a real Foundry Local instance, since that requires Windows/macOS.
+- Graphiti's own stated primary/default backend is Neo4j, not FalkorDB -- that path was **not** tested here at all (no Docker daemon and no reachable Neo4j download server in the dev sandbox this was built in). If you'd rather run real Neo4j, swap the driver construction in `graph_memory._build_graphiti()` for `graphiti_core.driver.neo4j_driver.Neo4jDriver` per [Graphiti's own docs](https://github.com/getzep/graphiti) -- untested here, but it's the officially supported path upstream.
+
+### Voice Mode: Hands-Free Conversation (opt-in)
+
+Click **Voice mode** to talk to Iris hands-free, the way you would with Siri or a similar voice assistant: it listens, transcribes what you said, replies, speaks the reply out loud, and then automatically starts listening again -- no clicking Record for every turn.
+
+**Deliberately not built on the browser's `SpeechRecognition` API.** In Chrome (and most Chromium browsers), that API sends your raw microphone audio to Google's servers to transcribe -- which would quietly break this whole project's offline/local-first design the moment you turned Voice mode on. Instead, Voice mode is built entirely from pieces this app already has: `MediaRecorder` captures audio locally, it's sent to `/upload_audio` and transcribed by the same local Whisper model used for the existing manual Record button, the transcript goes to `/chat` exactly like a typed message, and the reply comes back through the same local TTS pipeline as every other response.
+
+**How turn-taking works without a push-to-talk button:** the only new piece is knowing when you've stopped talking. `templates/chat.html` runs the microphone's audio through the Web Audio API's `AnalyserNode` and computes a rolling volume (RMS); once volume crosses a speaking threshold, a silence timer starts, and if volume stays low for `VOICE_SILENCE_MS` (1.2s), recording stops and that clip is sent off. A hard cap (`VOICE_MAX_RECORD_MS`, 15s) guards against a stuck-open mic recording forever. When the reply's audio finishes playing (`speakResponse`'s `onEnded` callback), Voice mode automatically starts listening again -- that's the whole hands-free loop. Turning Voice mode off releases the microphone (`getUserMedia` tracks are stopped) rather than just muting it.
+
+**Honest caveats:** this was written and syntax-checked, but the dev environment behind this repo has no display or microphone to drive a real browser through an actual spoken conversation, so the full loop (real speech in, real playback out, repeated) has **not** been manually verified end to end here -- please try it locally and adjust `VOICE_SPEECH_RMS` in `chat.html` if it cuts you off mid-sentence or never detects silence (background noise level varies a lot by microphone/room). Browser autoplay policies can also block audio playback that isn't triggered by a direct user gesture in some strict configurations; toggling Voice mode on is itself a user gesture, but this hasn't been checked against every browser.
 
 ### Troubleshooting
 

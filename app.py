@@ -6,6 +6,7 @@ from utils.web_search import search_web  # optional for online use
 from utils.doc_parser import parse_document
 from utils import mcp_manager
 from utils import local_tools
+from utils import graph_memory
 import os
 import re
 import json
@@ -44,6 +45,12 @@ threading.Thread(target=warm_up_tts, daemon=True).start()
 # MCP server) in the background. A no-op with zero cost if none are
 # configured -- see utils/mcp_manager.py.
 mcp_manager.start()
+
+# Optional cross-session memory (Graphiti + an embedded graph DB) -- see
+# utils/graph_memory.py. Off by default (ENABLE_GRAPH_MEMORY=1 to turn on);
+# a no-op with zero cost otherwise. Unlike the ChromaDB memory below, which
+# is scoped to one session_id, this persists facts across every session.
+graph_memory.start()
 
 # How many past user/assistant turns to feed back as conversation history.
 MAX_HISTORY_MESSAGES = 12
@@ -218,7 +225,7 @@ _PLAN_LIST_RE = re.compile(r"\[.*\]", re.DOTALL)
 def plan_subtasks(user_message, doc_context):
     system_parts = ["You are the planning coordinator for Iris, a helpful local AI assistant."]
     if doc_context:
-        system_parts.append(f"Relevant context from the user's uploaded documents:\n{doc_context}")
+        system_parts.append(f"Relevant context:\n{doc_context}")
     system_parts.append(
         "Break the user's request into a short list of concrete, self-contained "
         "subtasks that separate specialist workers can each complete independently, "
@@ -320,6 +327,15 @@ def chat():
     else:
         history = get_conversation_history(session_id)
         doc_context = retrieve_document_context(user_message, session_id)
+        # Facts learned in ANY earlier session (if ENABLE_GRAPH_MEMORY=1) --
+        # empty string immediately if disabled, so this never adds latency
+        # or behavior change when the feature is off. Folded into
+        # doc_context so both Workforce planning and the normal reply path
+        # see it without threading a third parameter through run_workforce.
+        graph_context = graph_memory.search(user_message)
+        if graph_context:
+            graph_block = f"Facts remembered from earlier conversations:\n{graph_context}"
+            doc_context = f"{doc_context}\n\n{graph_block}" if doc_context else graph_block
         tools = get_all_tools()  # local tools + whatever MCP servers are connected
 
         outcome = run_workforce(user_message, doc_context, tools, deep_think) if workforce else None
@@ -333,7 +349,7 @@ def chat():
             if doc_context:
                 messages.append({
                     "role": "system",
-                    "content": f"Relevant context from the user's uploaded documents:\n{doc_context}",
+                    "content": f"Relevant context:\n{doc_context}",
                 })
             messages.extend(history)
             messages.append({"role": "user", "content": user_message})
@@ -344,6 +360,13 @@ def chat():
 
     save_to_memory("user", user_message, session_id)
     save_to_memory("assistant", response, session_id)
+    # Fire-and-forget: extract entities/facts from this turn into the
+    # cross-session graph (no-op if ENABLE_GRAPH_MEMORY isn't set).
+    graph_memory.add_episode(
+        f"chat-{session_id}-{uuid.uuid4()}",
+        f"User: {user_message}\nAssistant: {response}",
+        source_description="chat",
+    )
 
     # Synthesize the reply to a local audio file the browser can play.
     # TTS runs fully offline (see utils/tts.py); if it fails for any
@@ -384,6 +407,15 @@ def upload_doc():
 
     for chunk in chunks:
         save_to_memory("document", chunk, session_id)
+
+    # Fire-and-forget: also persist this document's content into the
+    # cross-session graph, so it's retrievable in later sessions too, not
+    # just this one (no-op if ENABLE_GRAPH_MEMORY isn't set).
+    graph_memory.add_episode(
+        f"doc-{session_id}-{filename}",
+        content,
+        source_description=f"uploaded document: {filename}",
+    )
 
     os.remove(filepath)
     return jsonify({"message": "Document uploaded and stored in memory successfully", "session_id": session_id})

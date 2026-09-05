@@ -99,3 +99,32 @@ def foundry_embed(text, model=None):
     client, model_id = _get_client_and_model_id(alias)
     response = client.embeddings.create(model=model_id, input=text)
     return response.data[0].embedding
+
+
+def get_endpoint_config(chat_model=None, embedding_model=None):
+    """Resolve Foundry Local's base_url/api_key and concrete model ids
+    without building an `openai.OpenAI` client -- for callers that need to
+    hand these to a different SDK wrapper pointed at the same local
+    endpoint (e.g. utils/graph_memory.py's Graphiti client, which has its
+    own OpenAI-compatible client classes)."""
+    chat_alias = chat_model or DEFAULT_CHAT_MODEL
+    embed_alias = embedding_model or DEFAULT_EMBEDDING_MODEL
+
+    endpoint = os.environ.get("FOUNDRY_ENDPOINT")
+    if endpoint:
+        api_key = os.environ.get("FOUNDRY_API_KEY", "") or "not-needed"
+        return {
+            "base_url": endpoint,
+            "api_key": api_key,
+            "chat_model_id": chat_alias,
+            "embedding_model_id": embed_alias,
+        }
+
+    chat_manager = _get_manager(chat_alias)
+    embed_manager = _get_manager(embed_alias)
+    return {
+        "base_url": chat_manager.endpoint,
+        "api_key": chat_manager.api_key or "not-needed",
+        "chat_model_id": chat_manager.get_model_info(chat_alias).id,
+        "embedding_model_id": embed_manager.get_model_info(embed_alias).id,
+    }

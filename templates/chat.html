@@ -297,6 +297,16 @@
             background-color: #2471a3;
         }
 
+        #voice-mode-toggle {
+            background-color: #a9a9a9;
+            margin-left: 10px;
+        }
+
+        #voice-mode-toggle.active {
+            background-color: var(--recording-color);
+            animation: pulse 2s infinite;
+        }
+
         .breakdown {
             margin-top: 8px;
             text-align: left;
@@ -402,6 +412,13 @@
             </svg>
             Workforce: off
         </button>
+        <button id="voice-mode-toggle" title="Hands-free: listens, replies out loud, then listens again automatically -- like a voice assistant">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" fill="white"/>
+                <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" fill="white"/>
+            </svg>
+            Voice mode: off
+        </button>
         <span id="recording-status"></span>
     </div>
     <div id="upload-status"></div>
@@ -491,13 +508,26 @@
 
         // Speak a response using the server-generated local TTS audio
         // when available, falling back to the browser's built-in speech
-        // synthesis otherwise.
-        function speakResponse(text, audioUrl) {
-            if (audioMuted) return;
+        // synthesis otherwise. `onEnded`, if given, always fires exactly
+        // once when speaking finishes (or immediately if there's nothing
+        // to speak) -- Voice mode uses this to know when it's safe to
+        // start listening again.
+        function speakResponse(text, audioUrl, onEnded) {
+            if (audioMuted) {
+                if (onEnded) onEnded();
+                return;
+            }
 
             if (audioUrl) {
                 const audio = new Audio(audioUrl);
-                audio.play().catch(err => console.error("Audio playback error:", err));
+                if (onEnded) {
+                    audio.addEventListener('ended', onEnded, { once: true });
+                    audio.addEventListener('error', onEnded, { once: true });
+                }
+                audio.play().catch(err => {
+                    console.error("Audio playback error:", err);
+                    if (onEnded) onEnded();
+                });
                 return;
             }
 
@@ -506,8 +536,12 @@
                 speech.lang = 'en-US';
                 speech.onerror = function(event) {
                     console.error("Speech synthesis error:", event);
+                    if (onEnded) onEnded();
                 };
+                if (onEnded) speech.onend = onEnded;
                 window.speechSynthesis.speak(speech);
+            } else if (onEnded) {
+                onEnded();
             }
         }
 
@@ -922,6 +956,194 @@
             }
         });
         
+        // Voice mode: a hands-free loop -- listen, transcribe locally
+        // (Whisper via /upload_audio), reply (via /chat), speak it, then
+        // automatically start listening again, like Siri/a voice
+        // assistant. Deliberately NOT built on the browser's built-in
+        // SpeechRecognition API: in Chrome that sends raw audio to
+        // Google's servers to transcribe, which would break this app's
+        // offline/local-first design -- everything here reuses the
+        // existing local recording -> Whisper -> Foundry Local -> local
+        // TTS pipeline instead. "End of speech" is detected locally via
+        // the Web Audio API (volume dropping and staying low), not any
+        // cloud voice-activity-detection service.
+        let voiceModeActive = false;
+        let voiceModeStream = null;
+        let voiceModeRecorder = null;
+        let voiceModeAudioCtx = null;
+        let voiceModeSilenceTimer = null;
+        let voiceModeMaxTimer = null;
+        let voiceModeMonitorRAF = null;
+        let voiceModeHasSpoken = false;
+        let voiceModeChunks = [];
+
+        const VOICE_SILENCE_MS = 1200;     // stop after this long of quiet once speech was heard
+        const VOICE_MAX_RECORD_MS = 15000; // hard cap so a stuck mic can't listen forever
+        const VOICE_SPEECH_RMS = 0.02;     // volume threshold that counts as "speaking"
+
+        const voiceModeBtn = document.getElementById("voice-mode-toggle");
+        const voiceStatus = document.getElementById("recording-status");
+
+        function updateVoiceModeButton() {
+            voiceModeBtn.textContent = voiceModeActive ? "Voice mode: on" : "Voice mode: off";
+            voiceModeBtn.classList.toggle("active", voiceModeActive);
+        }
+        updateVoiceModeButton();
+
+        async function enableVoiceMode() {
+            try {
+                voiceModeStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            } catch (err) {
+                console.error("Microphone error:", err);
+                alert("Microphone access is required for Voice mode.");
+                return;
+            }
+            voiceModeAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            voiceModeActive = true;
+            updateVoiceModeButton();
+            startVoiceModeListening();
+        }
+
+        function disableVoiceMode() {
+            voiceModeActive = false;
+            clearTimeout(voiceModeSilenceTimer);
+            clearTimeout(voiceModeMaxTimer);
+            if (voiceModeMonitorRAF) cancelAnimationFrame(voiceModeMonitorRAF);
+            if (voiceModeRecorder && voiceModeRecorder.state === "recording") {
+                voiceModeRecorder.stop();
+            }
+            if (voiceModeStream) {
+                voiceModeStream.getTracks().forEach(t => t.stop());
+                voiceModeStream = null;
+            }
+            if (voiceModeAudioCtx) {
+                voiceModeAudioCtx.close();
+                voiceModeAudioCtx = null;
+            }
+            updateVoiceModeButton();
+            voiceStatus.textContent = "";
+            voiceStatus.classList.remove("active");
+        }
+
+        function startVoiceModeListening() {
+            if (!voiceModeActive || !voiceModeStream) return;
+
+            voiceModeChunks = [];
+            voiceModeHasSpoken = false;
+            voiceModeRecorder = new MediaRecorder(voiceModeStream);
+
+            const source = voiceModeAudioCtx.createMediaStreamSource(voiceModeStream);
+            const analyser = voiceModeAudioCtx.createAnalyser();
+            analyser.fftSize = 2048;
+            source.connect(analyser);
+            const dataArray = new Uint8Array(analyser.fftSize);
+
+            voiceModeRecorder.ondataavailable = (event) => {
+                if (event.data.size > 0) voiceModeChunks.push(event.data);
+            };
+            voiceModeRecorder.onstop = () => {
+                source.disconnect();
+                handleVoiceModeRecording();
+            };
+            voiceModeRecorder.start();
+
+            voiceStatus.textContent = "🎙️ Listening...";
+            voiceStatus.classList.add("active");
+
+            voiceModeMaxTimer = setTimeout(() => {
+                if (voiceModeRecorder && voiceModeRecorder.state === "recording") voiceModeRecorder.stop();
+            }, VOICE_MAX_RECORD_MS);
+
+            const monitor = () => {
+                if (!voiceModeActive || !voiceModeRecorder || voiceModeRecorder.state !== "recording") return;
+
+                analyser.getByteTimeDomainData(dataArray);
+                let sumSquares = 0;
+                for (let i = 0; i < dataArray.length; i++) {
+                    const v = (dataArray[i] - 128) / 128;
+                    sumSquares += v * v;
+                }
+                const rms = Math.sqrt(sumSquares / dataArray.length);
+
+                if (rms > VOICE_SPEECH_RMS) {
+                    voiceModeHasSpoken = true;
+                    clearTimeout(voiceModeSilenceTimer);
+                    voiceModeSilenceTimer = setTimeout(() => {
+                        if (voiceModeRecorder && voiceModeRecorder.state === "recording") voiceModeRecorder.stop();
+                    }, VOICE_SILENCE_MS);
+                }
+
+                voiceModeMonitorRAF = requestAnimationFrame(monitor);
+            };
+            monitor();
+        }
+
+        async function handleVoiceModeRecording() {
+            clearTimeout(voiceModeMaxTimer);
+            clearTimeout(voiceModeSilenceTimer);
+
+            if (!voiceModeHasSpoken || voiceModeChunks.length === 0) {
+                if (voiceModeActive) startVoiceModeListening();  // nothing said -- just listen again
+                return;
+            }
+
+            voiceStatus.textContent = "Transcribing...";
+            voiceStatus.classList.remove("active");
+
+            const audioBlob = new Blob(voiceModeChunks, { type: 'audio/webm' });
+            const formData = new FormData();
+            formData.append('audio', audioBlob, 'recording.webm');
+            formData.append('session_id', sessionId);
+
+            try {
+                const res = await fetch('/upload_audio', { method: 'POST', body: formData });
+                const data = await res.json();
+                sessionId = data.session_id || sessionId;
+                localStorage.setItem("chat_session_id", sessionId);
+
+                if (!data.text || !data.text.trim()) {
+                    voiceStatus.textContent = "";
+                    if (voiceModeActive) startVoiceModeListening();
+                    return;
+                }
+
+                addMessage(username, data.text, true);
+                showTypingIndicator();
+                voiceStatus.textContent = "Thinking...";
+
+                const chatRes = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: data.text, session_id: sessionId, deep_think: deepThink, workforce: workforce })
+                });
+                const chatData = await chatRes.json();
+                hideTypingIndicator();
+                addMessage("Iris", chatData.response, false, chatData.thinking, chatData.breakdown);
+                voiceStatus.textContent = "";
+
+                if (!voiceModeActive) return;  // turned off while we were waiting
+
+                voiceStatus.textContent = "🔊 Speaking...";
+                speakResponse(chatData.response, chatData.audio_url, () => {
+                    voiceStatus.textContent = "";
+                    if (voiceModeActive) startVoiceModeListening();
+                });
+            } catch (err) {
+                console.error("Voice mode error:", err);
+                hideTypingIndicator();
+                voiceStatus.textContent = "";
+                if (voiceModeActive) startVoiceModeListening();
+            }
+        }
+
+        voiceModeBtn.addEventListener("click", () => {
+            if (voiceModeActive) {
+                disableVoiceMode();
+            } else {
+                enableVoiceMode();
+            }
+        });
+
         // Initialize with welcome message
         window.onload = function() {
             setTimeout(() => {

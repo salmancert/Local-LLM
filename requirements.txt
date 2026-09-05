@@ -35,3 +35,10 @@ beautifulsoup4
 # The extract_rar_archive tool is only offered to the model if this import
 # succeeds, so it's safe to remove this line if you don't need RAR support.
 rarfile
+
+# Optional cross-session memory (utils/graph_memory.py), off by default --
+# set ENABLE_GRAPH_MEMORY=1 to use it. Uninstalled by default: every import
+# of these lives inside functions, so nothing above needs this package.
+# Requires Python 3.12+ (the [falkordblite] extra's embedded-graph-DB
+# dependency does). Uncomment to enable:
+# graphiti-core[falkordblite]

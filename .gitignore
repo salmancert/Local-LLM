@@ -12,3 +12,8 @@ workspace/
 # May contain machine-specific paths/credentials for MCP servers (e.g. a
 # Power BI MCP server's auth). Copy mcp_servers.example.json to get started.
 mcp_servers.json
+
+# Embedded graph database file for utils/graph_memory.py's optional
+# cross-session memory (ENABLE_GRAPH_MEMORY=1). redislite also drops a
+# matching .settings file next to it.
+graph_memory.db*
