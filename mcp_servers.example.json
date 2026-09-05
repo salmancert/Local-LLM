@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "powerbi": {
+      "command": "powerbi-modeling-mcp",
+      "args": ["--start"],
+      "env": {}
+    }
+  }
+}

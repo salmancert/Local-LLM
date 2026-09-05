@@ -1,9 +1,44 @@
 flask
-fitz
+PyMuPDF
 requests
-frontend
-tools
 chromadb
 openai-whisper
 pyttsx3
 waitress
+openai
+# Pinned: 1.0.0+ replaced this thin OpenAI-compatible REST client with an
+# unrelated in-process native-binding API (no .endpoint/.api_key).
+foundry-local-sdk==0.5.1
+sentence-transformers
+
+# Natural-sounding local TTS. Runs fully offline against the model
+# files bundled in models/kokoro/ -- no PyTorch, no external model hub.
+kokoro-onnx
+soundfile
+
+# MCP client for tool calling (e.g. a Power BI MCP server) -- see
+# mcp_servers.example.json. Pinned to the 2.x line this app's code targets;
+# a future major bump could change the client API again (it already did
+# once, from the classic ClientSession/stdio_client pattern to `Client`).
+mcp>=2,<3
+
+# Native local tools (utils/local_tools.py): spreadsheets, Word documents,
+# and web page text extraction. PDF reuses PyMuPDF above. zip/tar archive
+# support is stdlib (zipfile/tarfile), no extra package needed.
+openpyxl
+python-docx
+beautifulsoup4
+
+# RAR extraction (utils/local_tools.py). Also requires a system unrar/unar
+# binary on PATH to actually decompress -- rarfile just wraps one of those
+# (RAR is proprietary; there's no free encoder, so no create_rar_archive).
+# The extract_rar_archive tool is only offered to the model if this import
+# succeeds, so it's safe to remove this line if you don't need RAR support.
+rarfile
+
+# Optional cross-session memory (utils/graph_memory.py), off by default --
+# set ENABLE_GRAPH_MEMORY=1 to use it. Uninstalled by default: every import
+# of these lives inside functions, so nothing above needs this package.
+# Requires Python 3.12+ (the [falkordblite] extra's embedded-graph-DB
+# dependency does). Uncomment to enable:
+# graphiti-core[falkordblite]

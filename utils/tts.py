@@ -1,85 +1,110 @@
-# utils/tts.py
+"""Offline text-to-speech: synthesizes text to a local WAV file.
+
+Two engines are supported, both fully local/offline (nothing is sent to a
+remote service):
+
+  - Kokoro (default, if installed): an 82M-parameter neural TTS model
+    (StyleTTS 2 based) that sounds substantially more natural than
+    classic OS voices, while still being small/fast enough to run on
+    CPU. Uses kokoro-onnx (onnxruntime, no PyTorch needed) against the
+    model files bundled in models/kokoro/ -- no network access or
+    external model hub required at all, since those hosts are blocked
+    on some networks. See README for the optional pip install.
+  - pyttsx3 (fallback): uses the OS's built-in voices. Robotic but
+    lightweight, no model download, and always available, so it's what
+    keeps the app working if kokoro-onnx isn't installed or fails to load.
+
+TTS_ENGINE controls which is used:
+  - "auto" (default): try Kokoro, fall back to pyttsx3 if unavailable.
+  - "kokoro": use Kokoro only (still falls back to pyttsx3 on failure,
+    so a missing optional dependency never breaks a chat response).
+  - "pyttsx3": skip Kokoro entirely (useful on low-resource machines).
+"""
 import os
-import uuid
-import tempfile
-from threading import Event
-from chatterbox_tts import TTS  # offline package: chatterbox-tts
+import threading
 
-# NOTE: model names/voice names depend on chatterbox-tts version.
-# Replace 'default' and 'voices' with actual model/voice IDs if required.
+_kokoro_engine = None
+_kokoro_lock = threading.Lock()
 
-# Load engine once
-# If your chatterbox-tts requires different constructor args, adjust here.
-tts_engine = TTS(model="default", local=True)  # best-effort init
+_MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models", "kokoro")
+_DEFAULT_KOKORO_MODEL = os.path.join(_MODELS_DIR, "kokoro-v1.0.int8.onnx")
+_DEFAULT_KOKORO_VOICES = os.path.join(_MODELS_DIR, "voices-v1.0.bin")
 
-# Simple cache of available voices (depends on your local models)
-def available_voices():
-    """
-    Return list of available voice names/IDs. Adjust to your package if API differs.
-    """
+
+def _load_kokoro():
+    global _kokoro_engine
+    if _kokoro_engine is None:
+        with _kokoro_lock:
+            if _kokoro_engine is None:
+                from kokoro_onnx import Kokoro
+                model_path = os.environ.get("KOKORO_MODEL_PATH", _DEFAULT_KOKORO_MODEL)
+                voices_path = os.environ.get("KOKORO_VOICES_PATH", _DEFAULT_KOKORO_VOICES)
+                _kokoro_engine = Kokoro(model_path, voices_path)
+    return _kokoro_engine
+
+
+def _synthesize_with_kokoro(text, out_path):
+    import soundfile as sf
+
+    engine = _load_kokoro()
+    voice = os.environ.get("TTS_VOICE", "af_heart")
+    lang = os.environ.get("TTS_LANG", "en-us")
+    samples, sample_rate = engine.create(text, voice=voice, speed=1.0, lang=lang)
+    sf.write(out_path, samples, sample_rate)
+
+
+def _synthesize_with_pyttsx3(text, out_path):
+    import pyttsx3
+    engine = pyttsx3.init()
     try:
-        # some chatterbox versions expose voices()
-        voices = getattr(tts_engine, "voices", None)
-        if callable(voices):
-            return tts_engine.voices()
-        # fallback — common named voices
-        return ["default", "female_1", "male_1"]
-    except Exception:
-        return ["default"]
+        voices = engine.getProperty("voices")
+        for voice in voices:
+            if "female" in voice.name.lower() or "zira" in voice.name.lower():
+                engine.setProperty("voice", voice.id)
+                break
+        engine.setProperty("rate", 170)
+        engine.setProperty("volume", 1.0)
+        engine.save_to_file(text, out_path)
+        engine.runAndWait()
+    finally:
+        engine.stop()
 
-def synthesize_to_file(text: str, out_path: str, voice: str = "default"):
-    """
-    Synthesize text to out_path using chosen voice. Returns out_path.
-    """
-    # ensure folder exists
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    # The exact API to synthesize depends on chatterbox-tts version.
-    # Two common patterns:
-    # 1) audio = tts_engine.generate(text, voice=voice); audio.save(out_path)
-    # 2) tts_engine.synthesize_to_file(text, out_path, voice=voice)
-    try:
-        # try common generate + save pattern
-        gen = getattr(tts_engine, "generate", None)
-        if callable(gen):
-            audio = tts_engine.generate(text, voice=voice)
-            # audio might be a bytes object or have .save
-            if hasattr(audio, "save"):
-                audio.save(out_path)
-            elif isinstance(audio, (bytes, bytearray)):
-                with open(out_path, "wb") as f:
-                    f.write(audio)
-            else:
-                # try to call write out raw audio buffer
-                with open(out_path, "wb") as f:
-                    f.write(bytes(audio))
-            return out_path
 
-        # try direct synthesize_to_file
-        synth = getattr(tts_engine, "synthesize_to_file", None)
-        if callable(synth):
-            synth(text=text, file_path=out_path, voice=voice)
-            return out_path
+def synthesize_to_file(text: str, out_path: str) -> str:
+    """Synthesize `text` to a local WAV file at `out_path`. Returns out_path."""
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
-        # last resort - use text_to_speech
-        tts_engine.text_to_speech(text=text, file_path=out_path, voice=voice)
-        return out_path
-
-    except Exception as e:
-        raise RuntimeError(f"TTS generation failed: {e}")
-
-def synthesize_async(text: str, out_path: str, voice: str = "default"):
-    """
-    Starts async generation in background and returns an Event that is set when finished.
-    Writes file to out_path.
-    """
-    done = Event()
-
-    def _worker():
+    engine = os.environ.get("TTS_ENGINE", "auto").lower()
+    if engine in ("auto", "kokoro"):
         try:
-            synthesize_to_file(text, out_path, voice=voice)
-        finally:
-            done.set()
+            _synthesize_with_kokoro(text, out_path)
+            return out_path
+        except Exception as e:
+            print(f"[kokoro unavailable ({e}), falling back to pyttsx3]")
 
-    import threading
-    threading.Thread(target=_worker, daemon=True).start()
-    return done
+    _synthesize_with_pyttsx3(text, out_path)
+    return out_path
+
+
+def warm_up():
+    """Eagerly load Kokoro and run one throwaway synthesis so any one-time
+    cost (reading the ~90MB model file, building the onnxruntime session,
+    initializing the espeak-ng phonemizer backend) happens now, in the
+    background at startup, instead of during -- and slowing down or
+    tripping up -- a user's first chat request."""
+    if os.environ.get("TTS_ENGINE", "auto").lower() == "pyttsx3":
+        return
+
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        _synthesize_with_kokoro("Warming up.", tmp_path)
+        print("[kokoro warmed up]")
+    except Exception as e:
+        print(f"[kokoro warmup skipped: {e}]")
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass

@@ -1,7 +1,9 @@
 import chromadb
+from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
-chroma_client = chromadb.Client()
+# anonymized_telemetry is disabled so nothing leaves the machine.
+chroma_client = chromadb.Client(Settings(anonymized_telemetry=False))
 chroma_collection = chroma_client.get_or_create_collection(name="chat_memory")
 embedder = SentenceTransformer('all-MiniLM-L6-v2')  # Small, fast
 
