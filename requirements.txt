@@ -36,6 +36,12 @@ beautifulsoup4
 # succeeds, so it's safe to remove this line if you don't need RAR support.
 rarfile
 
+# Offline dictionary-based spellchecker for local__highlight_spelling_errors
+# (utils/local_tools.py) -- ships its dictionaries as local files, no
+# network call at runtime. Only offered to the model if this import
+# succeeds, so it's safe to remove if you don't need this tool.
+pyspellchecker
+
 # Optional cross-session memory (utils/graph_memory.py), off by default --
 # set ENABLE_GRAPH_MEMORY=1 to use it. Uninstalled by default: every import
 # of these lives inside functions, so nothing above needs this package.

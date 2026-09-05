@@ -43,6 +43,12 @@ try:
 except ImportError:
     _RARFILE_AVAILABLE = False
 
+try:
+    import spellchecker as _spellchecker_probe  # noqa: F401 -- just checking availability
+    _SPELLCHECKER_AVAILABLE = True
+except ImportError:
+    _SPELLCHECKER_AVAILABLE = False
+
 MAX_READ_CHARS = 20000
 MAX_FETCH_CHARS = 8000
 
@@ -164,6 +170,60 @@ def create_pdf(path, text):
     doc.save(full)
     doc.close()
     return f"Wrote PDF with {page_count} page(s) to {path}"
+
+
+def highlight_spelling_errors(path, output_path=None):
+    """Find likely misspelled words in a PDF and highlight them directly
+    in a saved copy -- the "do it on its own" version of proofreading,
+    versus just describing typos back in chat. Uses PyMuPDF's per-word
+    text positions (get_text("words")) to know exactly where each word
+    sits on the page, and pyspellchecker (a local, offline dictionary --
+    no network call, ever) to decide whether it's a real word.
+
+    This is dictionary-based, not grammar/context-aware: it will miss
+    real-word errors ("there" for "their") and can flag genuine but
+    obscure proper nouns/technical terms it doesn't recognize -- exactly
+    the tradeoffs of any offline spellchecker, called out here rather
+    than implied to be more than it is."""
+    from spellchecker import SpellChecker
+    import fitz  # PyMuPDF
+
+    full = _resolve_path(path)
+    doc = fitz.open(full)
+    checker = SpellChecker()
+
+    flagged = []
+    for page in doc:
+        for x0, y0, x1, y1, word, *_ in page.get_text("words"):
+            cleaned = re.sub(r"[^A-Za-z']", "", word)
+            if len(cleaned) < 3 or not any(c.isalpha() for c in cleaned):
+                continue
+            if cleaned.lower() in checker:
+                continue
+            annot = page.add_highlight_annot(fitz.Rect(x0, y0, x1, y1))
+            annot.set_colors(stroke=(1, 0.6, 0.2))
+            annot.update()
+            flagged.append((word, checker.correction(cleaned.lower())))
+
+    if output_path:
+        out_full = _resolve_path(output_path)
+    else:
+        base, ext = os.path.splitext(path)
+        out_full = _resolve_path(f"{base}_spellchecked{ext or '.pdf'}")
+    os.makedirs(os.path.dirname(out_full), exist_ok=True)
+    doc.save(out_full)
+    doc.close()
+
+    out_rel = os.path.relpath(out_full, WORKSPACE_DIR)
+    if not flagged:
+        return f"No likely spelling issues found. Saved an unmarked copy to {out_rel}."
+
+    preview_items = [f"'{w}'" + (f" (suggested: '{s}')" if s else "") for w, s in flagged[:30]]
+    more = f", and {len(flagged) - 30} more" if len(flagged) > 30 else ""
+    return (
+        f"Highlighted {len(flagged)} likely misspelled word(s) and saved the marked-up copy to "
+        f"{out_rel}: {'; '.join(preview_items)}{more}"
+    )
 
 
 # --- Spreadsheets (CSV / XLSX) -----------------------------------------
@@ -913,6 +973,22 @@ _SHELL_TOOL = {
     },
 }
 
+_SPELLCHECK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "local__highlight_spelling_errors",
+        "description": "Scan a PDF for likely misspelled words and save a copy with each one highlighted directly on the page. Offline dictionary-based spellcheck (no network call) -- catches typos/misspelled words, not grammar or wrong-word errors (e.g. 'there' vs 'their'), and can occasionally flag an obscure real word or proper noun it doesn't recognize.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "PDF path relative to the workspace root"},
+                "output_path": {"type": "string", "description": "Where to save the highlighted copy, relative to the workspace root (optional; defaults to '<name>_spellchecked.pdf')"},
+            },
+            "required": ["path"],
+        },
+    },
+}
+
 _HANDLERS = {
     "local__list_workspace_files": lambda a: list_workspace_files(a.get("subdirectory", "")),
     "local__read_text_file": lambda a: read_text_file(a["path"]),
@@ -922,6 +998,7 @@ _HANDLERS = {
     "local__delete_file": lambda a: delete_file(a["path"]),
     "local__read_pdf": lambda a: read_pdf(a["path"]),
     "local__create_pdf": lambda a: create_pdf(a["path"], a["text"]),
+    "local__highlight_spelling_errors": lambda a: highlight_spelling_errors(a["path"], a.get("output_path")),
     "local__read_spreadsheet": lambda a: read_spreadsheet(a["path"], a.get("sheet_name")),
     "local__write_spreadsheet": lambda a: write_spreadsheet(a["path"], a["rows"], a.get("sheet_name")),
     "local__write_spreadsheet_sheet": lambda a: write_spreadsheet_sheet(a["path"], a["sheet_name"], a["rows"]),
@@ -948,6 +1025,8 @@ def get_tool_schemas():
     tools = list(_STATIC_TOOLS)
     if _RARFILE_AVAILABLE:
         tools.append(_RAR_TOOL)
+    if _SPELLCHECKER_AVAILABLE:
+        tools.append(_SPELLCHECK_TOOL)
     if _EMAIL_CONFIGURED:
         tools.append(_EMAIL_TOOL)
     if ENABLE_SHELL_TOOL:
