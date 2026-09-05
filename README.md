@@ -173,21 +173,25 @@ Two more native tools exist but are **off unless you configure them**:
 For integrations that need a real running application or an OAuth app registration, point `utils/mcp_manager.py` at a dedicated MCP server instead of reimplementing that integration here. It's generic -- it doesn't know or care what server it's talking to.
 
 **Setup:**
-1. Copy `mcp_servers.example.json` to `mcp_servers.json` (gitignored -- it may end up holding paths or credentials specific to your machine). Only add the servers you actually want; every entry gets launched and connected to at startup.
-2. Add an entry per server, pointing `command`/`args`/`env` at however that server is launched (most run via `npx`) -- follow that server's own README for auth/setup:
-   - **Power BI**: [microsoft/powerbi-modeling-mcp](https://github.com/microsoft/powerbi-modeling-mcp) or [sulaiman013/powerbi-mcp](https://github.com/sulaiman013/powerbi-mcp)
+1. Install the server globally with `npm`, e.g. `npm install -g @microsoft/powerbi-modeling-mcp`. **Prefer this over invoking through `npx`** -- confirmed against the real Power BI and Playwright MCP servers: `npx -y <package>` has to check the npm registry to resolve which version to run before it can start, and on a slow or restricted network that check can hang indefinitely with no error, silently breaking the connection. A global install needs that check only once (at install time), and the server then starts in under a second every time after. If you'd rather not install globally, pin an exact version with `npx` (`npx -y <package>@<exact-version>`) instead of leaving it unpinned -- it's still one network check per launch, but at least a predictable one.
+2. Copy `mcp_servers.example.json` to `mcp_servers.json` (gitignored -- it may end up holding paths or credentials specific to your machine). Only add the servers you actually want; every entry gets launched and connected to at startup.
+3. Add an entry per server, pointing `command`/`args`/`env` at the installed binary -- follow that server's own README for auth/setup:
+   - **Power BI**: [microsoft/powerbi-modeling-mcp](https://github.com/microsoft/powerbi-modeling-mcp) (confirmed working end to end against the real server -- see below) or [sulaiman013/powerbi-mcp](https://github.com/sulaiman013/powerbi-mcp)
      ```json
-     "powerbi": { "command": "npx", "args": ["-y", "@microsoft/powerbi-modeling-mcp"], "env": {} }
+     "powerbi": { "command": "powerbi-modeling-mcp", "args": ["--start"], "env": {} }
      ```
+     The `--start` flag matters: without it, the server prints an interactive "Press any key to close" banner and crashes immediately, because stdin isn't a real terminal once it's launched as an MCP subprocess.
    - **Outlook / Microsoft 365** (mail, calendar, Excel, more): [Softeria/ms-365-mcp-server](https://github.com/Softeria/ms-365-mcp-server)
      ```json
-     "outlook": { "command": "npx", "args": ["-y", "@softeria/ms-365-mcp-server"], "env": {} }
+     "outlook": { "command": "ms-365-mcp-server", "args": [], "env": {} }
      ```
-   - **Browser automation** (clicking, filling forms, JS-rendered pages -- beyond what `local__fetch_webpage` can do): Microsoft's official [Playwright MCP](https://github.com/microsoft/playwright-mcp)
+   - **Browser automation** (clicking, filling forms, JS-rendered pages -- beyond what `local__fetch_webpage` can do): Microsoft's official [Playwright MCP](https://github.com/microsoft/playwright-mcp) (also confirmed working the same way -- global install, no `npx`)
      ```json
-     "browser": { "command": "npx", "args": ["-y", "@playwright/mcp@latest"], "env": {} }
+     "browser": { "command": "playwright-mcp", "args": [], "env": {} }
      ```
-3. Restart the app. On startup it connects to every configured server in the background (over stdio) and lists their tools; this never blocks a request -- a chat that arrives before a server finishes connecting just proceeds without tools for that one turn.
+4. Restart the app and check its startup log for `[MCP: connected to '<name>' (N tool(s))]` -- that confirms the handshake actually succeeded (a stuck `npx` connection instead just never prints anything, which is exactly the silent-hang failure mode step 1 avoids). Connecting happens in the background; this never blocks a request -- a chat that arrives before a server finishes connecting just proceeds without tools for that one turn.
+
+**Confirmed working for real** (not just against a scripted stand-in): connected to the actual published `@microsoft/powerbi-modeling-mcp` package and got back its real 21 tools (`measure_operations`, `table_operations`, `dax_query_operations`, `relationship_operations`, and so on, namespaced as `powerbi__measure_operations` etc.), correctly surfaced through this app's own `get_all_tools()`. What isn't tested here: actually querying a real Power BI/Fabric dataset -- that server authenticates interactively via a browser OAuth flow (`AuthenticationMode=InteractiveBrowser`), which needs a real desktop session to complete, and this development environment doesn't have Foundry Local or a Power BI tenant available to drive that flow end-to-end.
 
 **Zero cost when unused.** With no `mcp_servers.json` and none of the opt-in native tools configured, `get_all_tools()` returns `[]` and no `tools` parameter is even sent to Foundry Local -- behavior and latency are identical to not having this feature at all.
 
