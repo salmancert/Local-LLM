@@ -73,9 +73,17 @@ _COT_INSTRUCTIONS = (
 )
 
 _TOOLS_INSTRUCTIONS = (
-    "You have access to tools. Call a tool when it would genuinely help "
-    "answer the user's question (e.g. it needs current or external data "
-    "you don't already know); otherwise just answer directly."
+    "You have access to tools. If the user asks you to DO something to a "
+    "file or system -- create, edit, save, highlight, delete, run, send, "
+    "and so on -- you must actually call the matching tool to perform it. "
+    "Never say you've done something, and never describe how someone "
+    "could do it themselves, unless you actually called the tool in this "
+    "turn and its result confirms it -- a plausible-sounding sentence is "
+    "not the same as calling the tool. If no tool exists for what's being "
+    "asked, say that plainly instead of pretending to have done it. For "
+    "questions that just need information, call a tool only when it would "
+    "genuinely help (e.g. it needs current or external data you don't "
+    "already know); otherwise answer directly."
 )
 
 def build_system_prompt(tools_available, deep_think):
