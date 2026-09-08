@@ -171,27 +171,31 @@ def build_ambient_context():
     # Which folders the file tools can actually touch. Without this the
     # model guesses -- it told a user their desktop file "does not exist in
     # the local workspace" and offered to copy it, which it had no way to do.
+    #
+    # Everything here is phrased as a statement of fact, never as an
+    # instruction ("tell the user X", "advise them to Y"). That's not
+    # stylistic: this block is also given to the Workforce planner, whose
+    # job is to turn text into a subtask list, and it duly turned an earlier
+    # imperative version into literal subtasks ("Inform the user that the
+    # file is outside the workspace folder"). Facts describe the world;
+    # instructions get mistaken for the job.
     roots = local_tools.accessible_roots()
     if len(roots) > 1:
         listed = ", ".join(f"{label}/ ({path})" for label, path in roots.items())
         lines.append(
-            f"File tools can read and write in these folders: {listed}. Refer to files "
-            f"by a path starting with the folder name, e.g. 'Desktop/report.pdf'."
+            f"File tools can read and write in these folders: {listed}. Files are "
+            f"addressed by a path starting with the folder name, e.g. 'Desktop/report.pdf'."
         )
     else:
         lines.append(
             "File tools can only read and write inside the workspace folder "
-            f"({roots['workspace']}); files elsewhere on this machine, including the "
-            "desktop, are not reachable. If the user asks about a file outside it, say so "
-            "and tell them to either move the file there or restart the app with "
-            "ALLOW_USER_FOLDERS=true -- don't offer to copy it yourself, you can't."
+            f"({roots['workspace']}). Files elsewhere on this machine, including the "
+            "desktop, are unreachable, and no tool here can copy them in. Access to "
+            "Desktop, Documents and Downloads requires restarting the app with "
+            "ALLOW_USER_FOLDERS=true."
         )
 
-    lines.append(
-        "These facts are current -- use them directly rather than guessing or "
-        "saying you don't have access to the date, and don't call a tool just "
-        "to re-check them."
-    )
+    lines.append("The facts above are current as of this message.")
     return "\n".join(lines)
 
 def build_system_prompt(tools_available, deep_think):
@@ -250,45 +254,72 @@ def run_completion(messages, tools, max_tokens):
 
     return message.content or ""
 
-# Matches both the <thinking> tag this app's Deep think prompt asks for and
-# the <think> tag reasoning models emit natively. Qwen3 (the default model)
-# is one of those: it reasons in <think>...</think> whether or not Deep
-# think is on, so without this its raw chain-of-thought would be shown as
-# the reply, spoken aloud by TTS, and written into memory.
-_THINKING_RE = re.compile(r"<think(?:ing)?>(.*?)</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
-_OPEN_THINKING_RE = re.compile(r"<think(?:ing)?>", re.IGNORECASE)
+# Reasoning shows up in three shapes here, and all three have to be handled
+# or raw chain-of-thought ends up shown as the reply, spoken aloud by TTS,
+# and written into memory:
+#
+#   <thinking>...</thinking>  this app's own Deep think format
+#   <think>...</think>        a reasoning model emitting both tags
+#   ...</think>               a reasoning model emitting only the CLOSING tag
+#
+# That last one is the important one and is easy to miss. Qwen3 (the default
+# model) has an opening "<think>" baked into its chat template, so it's part
+# of the *prompt*, not the completion -- the text coming back starts straight
+# into reasoning and the first tag you ever see is the closing one. A pattern
+# that requires an opening tag silently matches nothing and passes the whole
+# monologue through, which is exactly what happened in testing.
+_THINK_TAG = r"think(?:ing)?"
+_THINKING_RE = re.compile(rf"<{_THINK_TAG}>(.*?)</{_THINK_TAG}>", re.DOTALL | re.IGNORECASE)
+_OPEN_THINKING_RE = re.compile(rf"<{_THINK_TAG}>", re.IGNORECASE)
+_CLOSE_THINKING_RE = re.compile(rf"</{_THINK_TAG}>", re.IGNORECASE)
 _ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
 
 def split_thinking(raw_response):
-    """Pull the reasoning and the answer apart. Falls back gracefully if
-    the model didn't follow the format (small local models don't always)."""
-    thinking_match = _THINKING_RE.search(raw_response)
-    answer_match = _ANSWER_RE.search(raw_response)
-    thinking = thinking_match.group(1).strip() if thinking_match else None
+    """Split a reply into (answer, reasoning). Falls back gracefully if the
+    model didn't follow any recognisable format -- small local models don't
+    always -- but never leaves a dangling think tag in the answer."""
+    raw_response = raw_response or ""
 
-    if answer_match:
-        answer = answer_match.group(1).strip()
-    elif thinking_match:
-        # Everything outside the reasoning block is the answer -- reasoning
-        # models put it after, but keep any preamble rather than dropping it.
-        answer = (
-            raw_response[:thinking_match.start()] + raw_response[thinking_match.end():]
-        ).strip() or thinking
-    else:
-        # An opening tag with no close means the reply was cut off mid-thought
-        # (hit max_tokens). Everything from the tag on is reasoning, so don't
-        # show it raw with a dangling "<think>" in front.
-        open_match = _OPEN_THINKING_RE.search(raw_response)
-        if open_match:
-            thinking = raw_response[open_match.end():].strip() or None
-            answer = raw_response[:open_match.start()].strip() or (
-                "[The model ran out of room while thinking and didn't reach an answer. "
+    # The app's own format wins when present: the model was explicitly asked
+    # for <answer>, so that's the most reliable signal of where the reply is.
+    answer_match = _ANSWER_RE.search(raw_response)
+
+    paired = _THINKING_RE.search(raw_response)
+    if paired:
+        thinking = paired.group(1).strip() or None
+        remainder = raw_response[:paired.start()] + raw_response[paired.end():]
+        answer = answer_match.group(1).strip() if answer_match else remainder.strip()
+        return (answer or thinking or ""), thinking
+
+    # Closing tag with no opening tag -- the prefilled-template case above.
+    close_match = _CLOSE_THINKING_RE.search(raw_response)
+    if close_match and not _OPEN_THINKING_RE.search(raw_response):
+        thinking = raw_response[:close_match.start()].strip() or None
+        after = raw_response[close_match.end():]
+        answer_after = _ANSWER_RE.search(after)
+        answer = (answer_after.group(1) if answer_after else after).strip()
+        if not answer:
+            # Ran out of tokens right after finishing the reasoning.
+            answer = (
+                "[The model finished thinking but ran out of room before answering. "
                 "Try again, or turn Deep think off for a shorter reply.]"
             )
-        else:
-            answer = raw_response.strip()
+        return answer, thinking
 
-    return answer, thinking
+    if answer_match:
+        return answer_match.group(1).strip(), None
+
+    # Opening tag with no close -- cut off mid-thought.
+    open_match = _OPEN_THINKING_RE.search(raw_response)
+    if open_match:
+        thinking = raw_response[open_match.end():].strip() or None
+        answer = raw_response[:open_match.start()].strip() or (
+            "[The model ran out of room while thinking and didn't reach an answer. "
+            "Try again, or turn Deep think off for a shorter reply.]"
+        )
+        return answer, thinking
+
+    return raw_response.strip(), None
 
 def save_to_memory(role, text, session_id):
     store = get_collection()
@@ -412,18 +443,28 @@ def plan_subtasks(user_message, doc_context):
     if doc_context:
         system_parts.append(f"Relevant context:\n{doc_context}")
     system_parts.append(
-        "Break the user's request into a short list of concrete, self-contained "
+        "Break THE USER'S MESSAGE BELOW into a short list of concrete, self-contained "
         "subtasks that separate specialist workers can each complete independently, "
-        f"in any order. Respond with ONLY a JSON array of 1 to {MAX_WORKFORCE_SUBTASKS} "
-        "short subtask description strings -- no prose, no markdown fences, nothing else. "
-        "If the request is simple enough that breaking it down wouldn't help, respond "
-        "with a single-item array containing the request itself, unchanged."
+        "in any order. Everything above is background information about the machine and "
+        "the user's files -- it describes the situation, it is not a list of things to "
+        "do, so never turn it into subtasks.\n\n"
+        f"Respond with ONLY a JSON array of 1 to {MAX_WORKFORCE_SUBTASKS} short subtask "
+        "description strings -- no prose, no markdown fences, nothing else. Most requests "
+        "do not need breaking down: if the user is asking one question, or asking for one "
+        "action on one file, respond with a single-item array containing their request "
+        "unchanged."
     )
     messages = [
         {"role": "system", "content": "\n\n".join(system_parts)},
         {"role": "user", "content": user_message},
     ]
     raw = run_completion(messages, tools=[], max_tokens=300)
+
+    # Strip reasoning before hunting for the JSON array. A reasoning model's
+    # monologue routinely contains brackets, and _PLAN_LIST_RE is greedy --
+    # left in, it would match from the first '[' anywhere in the reasoning to
+    # the last ']' anywhere after it and parse nothing useful.
+    raw = split_thinking(raw)[0]
 
     match = _PLAN_LIST_RE.search(raw)
     if match:
