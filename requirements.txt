@@ -9,7 +9,13 @@ openai
 # Pinned: 1.0.0+ replaced this thin OpenAI-compatible REST client with an
 # unrelated in-process native-binding API (no .endpoint/.api_key).
 foundry-local-sdk==0.5.1
-sentence-transformers
+
+# NOTE: sentence-transformers used to be here for the fallback embedder.
+# It's gone deliberately -- it downloads model weights from Hugging Face on
+# first use, which fails outright on networks that block huggingface.co, and
+# it drags in PyTorch (multiple GB) for a 22MB model. The fallback embedder
+# now runs the ONNX weights bundled in models/minilm/ via onnxruntime +
+# tokenizers, both of which chromadb already installs. See utils/embeddings.py.
 
 # Natural-sounding local TTS. Runs fully offline against the model
 # files bundled in models/kokoro/ -- no PyTorch, no external model hub.

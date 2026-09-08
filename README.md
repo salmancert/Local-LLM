@@ -14,12 +14,13 @@ The assistant leverages local language models through [Microsoft Foundry Local](
 ├── templates/           # HTML templates
 │   └── chat.html       # Main chat interface template
 ├── models/
-│   └── kokoro/           # Bundled Kokoro TTS model weights (see Text-to-Speech below)
+│   ├── kokoro/           # Bundled Kokoro TTS model weights (see Text-to-Speech below)
+│   └── minilm/           # Bundled fallback embedding model (see Embeddings below)
 ├── mcp_servers.example.json  # Template for configuring MCP tool servers (e.g. Power BI, Outlook)
 ├── workspace/            # Sandbox for local_tools.py's file tools (created at runtime, gitignored)
 └── utils/              # Utility modules
     ├── doc_parser.py       # Document parsing functionality
-    ├── embedding_store.py  # Standalone ChromaDB + sentence-transformers helper
+    ├── embedding_store.py  # Standalone in-memory ChromaDB helper (not used by app.py)
     ├── embeddings.py       # Embedding backend: Foundry Local, with an in-process fallback
     ├── foundry_client.py   # Client for local Foundry Local inference/embeddings
     ├── local_tools.py       # Native tools: spreadsheets, Word, PDF, notepad, archives, web fetch, calc, email, shell
@@ -77,7 +78,8 @@ All configuration is via environment variables; sensible local defaults are used
 | `FOUNDRY_MODEL` | `qwen2.5-7b` | Foundry Local catalog alias used for chat completions. Moved up from `phi-4-mini` (3.8B) after real-world testing showed the smaller model claiming it had done a file action without ever emitting a tool call -- tool-calling reliability scales with capability, and tools/MCP/Workforce/PDF-proofreading all depend on it. 7B is the middle ground: a real step up while still loading on a 16GB machine. Stronger: `phi-4`, `qwen2.5-14b`, or `gpt-oss-20b` (Microsoft's own pick for agentic tool-calling work, but effectively needs a capable GPU). Faster: `qwen2.5-1.5b`, `qwen2.5-0.5b`. If the alias you set isn't in your machine's catalog, the app logs that and falls back to the best one that is, rather than failing |
 | `FOUNDRY_EMBEDDING_MODEL` | `qwen3-embedding-0.6b` | Foundry Local catalog alias used for embeddings. If it (and the other known embedding aliases) aren't in your catalog, the app falls back to a small in-process embedder -- see Embeddings below |
 | `EMBEDDING_BACKEND` | `auto` | `auto` (use Foundry Local, fall back to in-process if unavailable), `foundry` (require Foundry Local -- error rather than fall back), or `local` (always use the in-process model, never call Foundry Local for embeddings) |
-| `FALLBACK_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model used when the fallback backend is active |
+| `FALLBACK_EMBEDDING_MODEL_PATH` | `models/minilm/model.onnx` | Override the bundled fallback embedding model file |
+| `FALLBACK_EMBEDDING_TOKENIZER_PATH` | `models/minilm/tokenizer.json` | Override the bundled fallback tokenizer file |
 | `CHROMA_COLLECTION` | `chat_memory` | ChromaDB collection name. Point at a new name if you switch embedding backends -- see Embeddings below |
 | `FOUNDRY_ENDPOINT` | *(auto-discovered)* | Overrides the endpoint instead of discovering it via the SDK (e.g. a remote Foundry Local instance) |
 | `FOUNDRY_API_KEY` | *(none)* | API key to send when `FOUNDRY_ENDPOINT` is set |
@@ -128,20 +130,32 @@ Every `/chat` response is synthesized to a local WAV file and returned as `audio
 
 If TTS fails entirely, the frontend falls back to the browser's built-in `speechSynthesis` API.
 
+### Knowing the date, time, and what machine it's on
+
+A language model has no clock and no idea what machine it's running on. Iris used to have only `local__get_current_datetime` for this, which meant knowing today's date depended on the model *choosing to call a tool* — and a small local model will cheerfully invent a date instead (the same failure mode that had it claiming to have proofread a PDF it never touched).
+
+So the basics are now injected into every system prompt instead, by `build_ambient_context()` in `app.py`: the current date, time and timezone, the operating system, and the username. No tool call, no round trip, always correct. The Workforce planner and its workers get the same block, since a subtask like "summarize this week's numbers" is meaningless without knowing what week it is.
+
+That block is deliberately short, because it's prepended to *every* request. Anything bulkier — architecture, Python version, hostname, CPU cores, free disk space, the workspace path — lives in `local__get_system_info`, which the model can call when it actually needs it rather than carrying it in context forever.
+
 ### Embeddings (and what happens when Foundry Local can't do them)
 
 Conversation memory and document search both need embeddings. Those normally come from Foundry Local's embedding model, but embeddings are a comparatively recent Foundry Local addition, and real-world testing hit the case where **the configured embedding model simply isn't in that machine's catalog** — which silently disabled memory and document search entirely, since every embedding call failed. `utils/embeddings.py` fixes that with two layers:
 
 1. **Catalog-aware model selection** (`utils/foundry_client.py`). The Foundry Local SDK can list the catalog *without downloading anything* (`FoundryLocalManager()` with no alias, then `list_catalog_models()`), so the app now checks whether the alias you asked for actually exists before using it. If it doesn't, it walks a fallback list, and for embeddings it will also accept any catalog model whose task looks like an embedding task. It logs exactly what it picked and why. This also fixes a bad failure mode in the old code: `get_model_info()` returns `None` (it does not raise) for an unknown alias, so `get_model_info(alias).id` blew up with an opaque `AttributeError` instead of saying "that model isn't in your catalog."
-2. **An in-process fallback embedder.** If the catalog has no embedding model at all — or Foundry embeddings fail for any other reason — the app falls back to `sentence-transformers` running in-process (`all-MiniLM-L6-v2` by default: 384-dim, ~80MB, CPU-fast). `sentence-transformers` was already a dependency, so this adds no new package. The choice is lazy and sticky: nothing is probed at startup, the first embedding call decides, and once it falls back it stays fallen back for the life of the process.
+2. **A bundled in-process fallback embedder.** If the catalog has no embedding model at all — or Foundry embeddings fail for any other reason — the app falls back to **all-MiniLM-L6-v2 running in-process via onnxruntime**, against model files committed to this repo in `models/minilm/`:
+   - `model.onnx` (~86 MB, int8-quantized, 384 dimensions)
+   - `tokenizer.json`, `vocab.txt`, and the model's config files
+
+   These are committed for exactly the same reason as the Kokoro TTS weights, and it's not hypothetical: the first version of this fallback used `sentence-transformers`, which downloads from `huggingface.co` on first use, and that failed immediately for a user whose network blocks Hugging Face — which is precisely the kind of environment this project is built for. **The fallback now needs no network access, ever.** The files come from the tarball Chroma publishes for its own default embedder (not Hugging Face), and running them needs only `onnxruntime` and `tokenizers`, both of which `chromadb` already depends on — so the fallback adds no new package either.
+
+   The choice is lazy and sticky: nothing is probed at startup, the first embedding call decides, and once it falls back it stays fallen back for the life of the process.
 
 Force either backend with `EMBEDDING_BACKEND=foundry` (error instead of falling back) or `EMBEDDING_BACKEND=local` (never call Foundry Local for embeddings at all).
 
-**One caveat, stated plainly:** the fallback model's weights download from Hugging Face on first use, then cache and run offline forever after. That first download is the one moment this app touches the network for a core feature — unlike Kokoro TTS, whose weights are committed to this repo precisely to avoid that. If the machine is permanently offline, pre-cache the model (or copy an existing `HF_HOME` cache in) before relying on the fallback.
-
 **Switching backends breaks an existing collection.** A ChromaDB collection is locked to the vector size first written to it, and the two backends differ (1024-dim vs 384-dim), so writing fallback vectors into a collection built from Foundry vectors fails with a dimension-mismatch error. The app detects that specific error and prints what to do rather than a raw traceback: either restore the original embedding model, or set `CHROMA_COLLECTION` to a new name to start fresh without deleting `chroma_store/` and losing your history.
 
-**Testing note:** the catalog-selection logic and the backend-fallback control flow were both tested directly against the production code (5 catalog scenarios including the exact reported bug; 7 fallback scenarios covering automatic switching, stickiness, order preservation, both `EMBEDDING_BACKEND` pins, and empty input). What was *not* exercised in this project's dev sandbox is the real `sentence-transformers` model load itself — installing torch exceeded the sandbox's time budget — so that one step is stubbed in the tests and relies on `all-MiniLM-L6-v2` being the single most widely used model in that library.
+**Testing note:** all of this is tested against the production code. Catalog selection: 5 scenarios, including the exact reported bug (no embedding model in the catalog). Backend fallback control flow: 7 scenarios (automatic switching, stickiness, order preservation, both `EMBEDDING_BACKEND` pins, empty input). The bundled ONNX embedder: 8 scenarios run against the real model file with real onnxruntime inference — correct 384-dim output, L2-normalized, semantically sane (related sentences scored 0.61 vs -0.00 for unrelated), deterministic, correct ordering across batches larger than the internal batch size, over-long inputs truncated rather than crashed, and no network access required. That last set also verified that padding each batch to its longest item gives identical vectors to Chroma's fixed 256-token padding (similarity 1.000000), which is what makes the faster dynamic padding safe to use.
 
 ### Conversation Memory
 
@@ -182,7 +196,8 @@ Small local models are not always reliable at deciding when/how to call tools --
 | `local__create_tar_archive` / `local__extract_tar_archive` | `.tar`, `.tar.gz`/`.tgz`, `.tar.bz2` |
 | `local__extract_rar_archive` | `.rar` extraction only -- RAR is proprietary with no free encoder, so there's no create; only offered if the `rarfile` package is installed (also needs a system `unrar`/`unar` binary on `PATH` to actually decompress) |
 | `local__calculate` | Arithmetic (`+ - * / // % **`), evaluated by a whitelisted AST walk -- no `eval()`, so it can't be turned into code execution regardless of what expression the model passes |
-| `local__get_current_datetime` | The model doesn't otherwise reliably know today's date |
+| `local__get_current_datetime` | Current date/time with timezone and UTC offset. Rarely needed now that this is injected into every prompt (see Knowing the date below), but available for explicit re-checks |
+| `local__get_system_info` | Facts about the machine: OS and version, architecture, Python version, username, hostname, CPU cores, free disk space, workspace path |
 | `local__fetch_webpage` | Fetch a URL, strip scripts/nav/styling, return readable text -- this is "web browsing": research and reading, not clicking/filling forms (see Playwright below for that) |
 | `local__list_workspace_files` | List what's in the workspace |
 

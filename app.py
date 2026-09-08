@@ -9,6 +9,7 @@ from utils import mcp_manager
 from utils import local_tools
 from utils import graph_memory
 import os
+import platform
 import re
 import json
 import uuid
@@ -93,11 +94,39 @@ _TOOLS_INSTRUCTIONS = (
     "already know); otherwise answer directly."
 )
 
+def build_ambient_context():
+    """Facts about right now and this machine, injected into every system
+    prompt.
+
+    A model has no clock and no idea what machine it's on, and asking it to
+    call a tool for something as basic as today's date is both a wasted
+    round trip and unreliable -- a small local model will happily invent a
+    date instead of calling the tool (the same failure mode that had it
+    claiming to have edited a PDF it never touched). Handing it these facts
+    up front means it simply knows them.
+
+    Kept deliberately short: this is prepended to every single request, so
+    anything bulky belongs in the local__get_system_info tool instead."""
+    now = datetime.datetime.now().astimezone()
+    lines = [
+        f"Current date and time: {now.strftime('%A, %d %B %Y, %H:%M')} ({now.tzname()}).",
+        f"Operating system: {platform.system()} {platform.release()}.",
+    ]
+    user = os.environ.get("USERNAME") or os.environ.get("USER")
+    if user:
+        lines.append(f"User: {user}.")
+    lines.append(
+        "These facts are current -- use them directly rather than guessing or "
+        "saying you don't have access to the date, and don't call a tool just "
+        "to re-check them."
+    )
+    return "\n".join(lines)
+
 def build_system_prompt(tools_available, deep_think):
     """Chain-of-thought is opt-in (deep_think) because it roughly doubles
     output length on every single reply, which is real added latency on a
     small local model -- not something to pay by default on every "hi"."""
-    parts = ["You are Iris, a helpful local AI assistant."]
+    parts = ["You are Iris, a helpful local AI assistant.", build_ambient_context()]
     if tools_available:
         parts.append(_TOOLS_INSTRUCTIONS)
     if deep_think:
@@ -282,7 +311,10 @@ WORKFORCE_MAX_WORKERS = 3
 _PLAN_LIST_RE = re.compile(r"\[.*\]", re.DOTALL)
 
 def plan_subtasks(user_message, doc_context):
-    system_parts = ["You are the planning coordinator for Iris, a helpful local AI assistant."]
+    system_parts = [
+        "You are the planning coordinator for Iris, a helpful local AI assistant.",
+        build_ambient_context(),
+    ]
     if doc_context:
         system_parts.append(f"Relevant context:\n{doc_context}")
     system_parts.append(
@@ -320,7 +352,10 @@ def run_worker(subtask, tools):
             "content": (
                 "You are a focused specialist worker completing exactly one subtask "
                 "as part of a larger effort coordinated by Iris. Do only this subtask, "
-                "be concise and concrete, and use tools if they help."
+                "be concise and concrete, and use tools if they help.\n\n"
+                + build_ambient_context()
+                + "\n\n"
+                + _TOOLS_INSTRUCTIONS
             ),
         },
         {"role": "user", "content": subtask},

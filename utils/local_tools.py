@@ -706,7 +706,54 @@ def calculate(expression):
 
 def get_current_datetime():
     import datetime
-    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S %A")
+    now = datetime.datetime.now().astimezone()
+    return now.strftime("%Y-%m-%d %H:%M:%S %A") + f" ({now.tzname()}, UTC{now.strftime('%z')})"
+
+
+def get_system_info():
+    """Basic facts about the machine this is running on. The date/time and
+    OS name are already injected into every system prompt (see
+    build_ambient_context in app.py) -- this is for the rest: hardware,
+    disk space, paths, which the model should ask for rather than have
+    permanently occupying its context."""
+    import datetime
+    import getpass
+    import platform
+    import shutil
+    import socket
+
+    now = datetime.datetime.now().astimezone()
+    lines = [
+        f"Date and time: {now.strftime('%A, %Y-%m-%d %H:%M:%S')} ({now.tzname()}, UTC{now.strftime('%z')})",
+        f"Operating system: {platform.system()} {platform.release()} ({platform.version()})",
+        f"Architecture: {platform.machine()}",
+        f"Python: {platform.python_version()}",
+    ]
+
+    # Each of these can fail in odd environments (no username, no
+    # resolvable hostname, unreadable mount) -- none is worth failing the
+    # whole call over.
+    for label, getter in (
+        ("User", getpass.getuser),
+        ("Hostname", socket.gethostname),
+        ("CPU cores", lambda: str(os.cpu_count())),
+    ):
+        try:
+            lines.append(f"{label}: {getter()}")
+        except Exception:
+            pass
+
+    try:
+        usage = shutil.disk_usage(WORKSPACE_DIR)
+        lines.append(
+            f"Disk (workspace volume): {usage.free // (1024 ** 3)} GB free of "
+            f"{usage.total // (1024 ** 3)} GB"
+        )
+    except Exception:
+        pass
+
+    lines.append(f"Workspace directory: {WORKSPACE_DIR}")
+    return "\n".join(lines)
 
 
 # --- Email (opt-in: only offered if SMTP_* is configured) --------------
@@ -1058,7 +1105,15 @@ _STATIC_TOOLS = [
         "type": "function",
         "function": {
             "name": "local__get_current_datetime",
-            "description": "Get the current local date and time.",
+            "description": "Get the current local date and time, with timezone and UTC offset.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "local__get_system_info",
+            "description": "Get facts about the machine this is running on: OS and version, architecture, Python version, username, hostname, CPU core count, free disk space, and the workspace directory path.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -1154,6 +1209,7 @@ _HANDLERS = {
     "local__extract_rar_archive": lambda a: extract_rar_archive(a["path"], a.get("destination", "")),
     "local__calculate": lambda a: calculate(a["expression"]),
     "local__get_current_datetime": lambda a: get_current_datetime(),
+    "local__get_system_info": lambda a: get_system_info(),
     "local__send_email": lambda a: send_email(a["to"], a["subject"], a["body"]),
     "local__run_shell_command": lambda a: run_shell_command(a["command"]),
 }
