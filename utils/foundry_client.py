@@ -16,33 +16,41 @@ from types import SimpleNamespace
 # unrelated in-process native binding API (no `.endpoint`/`.api_key`), so
 # an unpinned install would silently break this module.
 
-# Which chat model to use. The default moved up from phi-4-mini (3.8B) to
-# qwen2.5-7b after real-world testing showed the smaller model failing at
-# the thing this app leans on hardest: it would answer "I've highlighted
-# the spelling errors" without ever emitting a tool call, so no file was
-# produced. Tool-calling reliability scales with model capability, and
-# every headline feature here (tools, MCP, Workforce, the PDF grammar
-# pass) depends on the model actually deciding to call a tool.
+# Which chat model to use. This default has moved twice, both times for
+# the same reason: tool-calling reliability is what this app lives or dies
+# on. phi-4-mini (3.8B) would answer "I've highlighted the spelling errors"
+# without ever emitting a tool call, so no file was produced; qwen2.5-7b
+# fixed the worst of that, and qwen3-8b is a generation newer again at
+# essentially the same size, with notably stronger agentic/tool-use
+# behavior. Tools, MCP, Workforce and the PDF grammar pass all depend on
+# the model actually deciding to call a tool.
 #
-# 7B is the deliberate middle: a real step up from 3.8B while still
-# loading on a 16GB machine, where 14B+ starts to hurt. If you have the
-# hardware, FOUNDRY_MODEL=phi-4 or qwen2.5-14b are stronger again, and
-# gpt-oss-20b stronger still (Microsoft's own recommendation for agentic
-# tool-calling work, but it effectively needs a capable GPU). Going the
-# other way, qwen2.5-1.5b / qwen2.5-0.5b trade capability for raw speed.
-DEFAULT_CHAT_MODEL = os.environ.get("FOUNDRY_MODEL", "qwen2.5-7b")
+# Note qwen3 reasons in <think>...</think> natively, whether or not Deep
+# think is on -- app.py's split_thinking() strips those so raw reasoning
+# doesn't end up shown, spoken, and written to memory.
+#
+# Stronger if you have the hardware: qwen3-14b, phi-4, qwen2.5-14b, or
+# gpt-oss-20b (Microsoft's own pick for agentic tool-calling work, but it
+# effectively needs a capable GPU). Faster/smaller: qwen3-4b, qwen3-1.7b,
+# qwen2.5-1.5b.
+DEFAULT_CHAT_MODEL = os.environ.get("FOUNDRY_MODEL", "qwen3-8b")
 
 # Tried in order when the configured chat model isn't in this machine's
-# catalog. Roughly ordered "most capable that's still locally practical"
-# first, with small models at the end so the app still runs on modest
-# hardware rather than failing outright.
+# catalog. Ordered newest-generation-and-still-locally-practical first,
+# with small models at the end so the app still runs on modest hardware
+# rather than failing outright. Aliases here were checked against a real
+# Foundry Local catalog listing rather than guessed.
 CHAT_MODEL_FALLBACKS = [
+    "qwen3-8b",
     "qwen2.5-7b",
     "phi-4",
+    "qwen3-4b",
     "mistral-7b-v0.2",
+    "qwen3-14b",
     "qwen2.5-14b",
     "phi-4-mini",
     "phi-3.5-mini",
+    "qwen3-1.7b",
     "qwen2.5-1.5b",
     "qwen2.5-0.5b",
 ]
@@ -101,24 +109,46 @@ def _catalog_aliases():
     return catalog
 
 
-def _resolve_alias(preferred, fallbacks, kind):
+def _resolve_alias(preferred, fallbacks, kind, require_tool_calling=False):
     """The first of `preferred` + `fallbacks` actually present in the
     catalog. Returns None if none of them are (and, for embeddings, that's
     a normal outcome -- see utils/embeddings.py). Note get_model_info()
     returns None rather than raising for an unknown alias, which is why
     the old `get_model_info(alias).id` blew up with an opaque
-    AttributeError when an alias wasn't in the catalog."""
+    AttributeError when an alias wasn't in the catalog.
+
+    `require_tool_calling` prefers models the catalog marks as supporting
+    tool calling (FoundryModelInfo.supports_tool_calling). Falling back to
+    a model that can't call tools would quietly disable this app's tools,
+    MCP, Workforce and PDF proofreading, so it's worth skipping past one
+    that can't -- but it's a preference, not a hard filter: a machine whose
+    catalog has only non-tool models should still get a working chatbot."""
     catalog = _catalog_aliases()
     candidates = [preferred] + [a for a in fallbacks if a != preferred]
 
     if not catalog:
         return preferred  # catalog unreadable -- just try what was asked for
 
-    for alias in candidates:
-        if alias in catalog:
-            if alias != preferred:
-                print(f"[Foundry: '{preferred}' isn't in this machine's catalog, using '{alias}' instead]")
-            return alias
+    def _announce(alias):
+        if alias != preferred:
+            print(f"[Foundry: '{preferred}' isn't usable on this machine, using '{alias}' instead]")
+        return alias
+
+    present = [alias for alias in candidates if alias in catalog]
+
+    if require_tool_calling:
+        for alias in present:
+            if getattr(catalog[alias], "supports_tool_calling", False):
+                return _announce(alias)
+        if present:
+            print(
+                f"[Foundry: none of the preferred chat models support tool calling on this "
+                f"machine; using '{present[0]}', so tools/MCP/Workforce may not work. "
+                f"'foundry model list' shows which models have the 'tools' task.]"
+            )
+            return _announce(present[0])
+    elif present:
+        return _announce(present[0])
 
     available = ", ".join(sorted(catalog)) or "(none)"
     print(f"[Foundry: none of {candidates} are in the catalog for {kind}. Available: {available}]")
@@ -194,7 +224,7 @@ def resolve_chat_model():
     one if the catalog has it, otherwise the best available fallback."""
     if os.environ.get("FOUNDRY_ENDPOINT"):
         return DEFAULT_CHAT_MODEL  # remote endpoint -- no local catalog to check
-    return _resolve_alias(DEFAULT_CHAT_MODEL, CHAT_MODEL_FALLBACKS, "chat")
+    return _resolve_alias(DEFAULT_CHAT_MODEL, CHAT_MODEL_FALLBACKS, "chat", require_tool_calling=True)
 
 
 @lru_cache(maxsize=1)

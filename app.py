@@ -250,11 +250,17 @@ def run_completion(messages, tools, max_tokens):
 
     return message.content or ""
 
-_THINKING_RE = re.compile(r"<thinking>(.*?)</thinking>", re.DOTALL | re.IGNORECASE)
+# Matches both the <thinking> tag this app's Deep think prompt asks for and
+# the <think> tag reasoning models emit natively. Qwen3 (the default model)
+# is one of those: it reasons in <think>...</think> whether or not Deep
+# think is on, so without this its raw chain-of-thought would be shown as
+# the reply, spoken aloud by TTS, and written into memory.
+_THINKING_RE = re.compile(r"<think(?:ing)?>(.*?)</think(?:ing)?>", re.DOTALL | re.IGNORECASE)
+_OPEN_THINKING_RE = re.compile(r"<think(?:ing)?>", re.IGNORECASE)
 _ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL | re.IGNORECASE)
 
 def split_thinking(raw_response):
-    """Pull the <thinking>/<answer> blocks apart. Falls back gracefully if
+    """Pull the reasoning and the answer apart. Falls back gracefully if
     the model didn't follow the format (small local models don't always)."""
     thinking_match = _THINKING_RE.search(raw_response)
     answer_match = _ANSWER_RE.search(raw_response)
@@ -263,10 +269,24 @@ def split_thinking(raw_response):
     if answer_match:
         answer = answer_match.group(1).strip()
     elif thinking_match:
-        # No (or truncated) </answer> tag -- use whatever follows thinking.
-        answer = raw_response[thinking_match.end():].strip() or thinking
+        # Everything outside the reasoning block is the answer -- reasoning
+        # models put it after, but keep any preamble rather than dropping it.
+        answer = (
+            raw_response[:thinking_match.start()] + raw_response[thinking_match.end():]
+        ).strip() or thinking
     else:
-        answer = raw_response.strip()
+        # An opening tag with no close means the reply was cut off mid-thought
+        # (hit max_tokens). Everything from the tag on is reasoning, so don't
+        # show it raw with a dangling "<think>" in front.
+        open_match = _OPEN_THINKING_RE.search(raw_response)
+        if open_match:
+            thinking = raw_response[open_match.end():].strip() or None
+            answer = raw_response[:open_match.start()].strip() or (
+                "[The model ran out of room while thinking and didn't reach an answer. "
+                "Try again, or turn Deep think off for a shorter reply.]"
+            )
+        else:
+            answer = raw_response.strip()
 
     return answer, thinking
 
