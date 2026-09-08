@@ -166,3 +166,19 @@ def embed(text):
     """Single-text convenience wrapper. Prefer embed_batch() for more than
     a couple of texts -- see foundry_embed_batch's docstring for why."""
     return embed_batch([text])[0]
+
+
+_dimension = None
+
+
+def dimension():
+    """How many numbers are in one of this backend's vectors.
+
+    Costs one tiny embedding call the first time, then it's cached. Callers
+    use this to keep vector stores from different backends apart: a
+    ChromaDB collection is locked to the size first written to it, so
+    writing 384-dim vectors into a collection built at 768 fails outright."""
+    global _dimension
+    if _dimension is None:
+        _dimension = len(embed("dimension probe"))
+    return _dimension

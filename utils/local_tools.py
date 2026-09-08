@@ -16,6 +16,9 @@ Safety:
     root). Every path is resolved and checked to stay inside it before
     any read/write, so a tool call can't read or overwrite files
     elsewhere on the machine, including via `..` traversal.
+    ALLOW_USER_FOLDERS / EXTRA_TOOL_DIRS can widen this to specific extra
+    folders (see _discover_extra_roots) -- opt-in, because everything
+    added gets the same read AND write access as the workspace.
   - Sending email requires SMTP_HOST/SMTP_USER/SMTP_PASSWORD to be
     configured; the tool isn't even offered to the model otherwise.
   - Shell command execution is off by default. It only becomes available
@@ -63,16 +66,113 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 _EMAIL_CONFIGURED = bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD)
 
 
+def _discover_extra_roots():
+    """Folders outside the workspace that file tools may also touch.
+
+    Off by default. The workspace sandbox is this app's real safety
+    boundary (tool calls are LLM-decided, and the model's context can carry
+    text from web pages, documents and MCP servers), so reaching outside it
+    is an explicit decision, not a default.
+
+    But "proofread the PDF on my desktop" is a completely reasonable thing
+    to ask, and refusing it forever isn't useful either. Two opt-ins:
+
+      ALLOW_USER_FOLDERS=true  adds Desktop, Documents and Downloads
+      EXTRA_TOOL_DIRS=...      adds specific folders (os.pathsep-separated)
+
+    Whatever is enabled is granted the same read AND write access as the
+    workspace -- so enable the narrowest thing that does the job.
+    """
+    roots = {}
+
+    if os.environ.get("ALLOW_USER_FOLDERS", "").strip().lower() in ("1", "true", "yes"):
+        home = os.path.expanduser("~")
+        for name in ("Desktop", "Documents", "Downloads"):
+            path = os.path.join(home, name)
+            if os.path.isdir(path):
+                roots[name] = os.path.realpath(path)
+
+    for entry in os.environ.get("EXTRA_TOOL_DIRS", "").split(os.pathsep):
+        entry = entry.strip()
+        if not entry:
+            continue
+        path = os.path.realpath(os.path.expanduser(entry))
+        if os.path.isdir(path):
+            roots[os.path.basename(path) or path] = path
+        else:
+            print(f"[local_tools: EXTRA_TOOL_DIRS entry is not a directory, ignoring: {entry}]")
+
+    return roots
+
+
+EXTRA_ROOTS = _discover_extra_roots()
+
+
+def accessible_roots():
+    """{label: absolute path} for every directory the file tools can use.
+    app.py surfaces this to the model so it knows what it can actually
+    reach instead of guessing (or claiming it can't do anything)."""
+    roots = {"workspace": os.path.realpath(WORKSPACE_DIR)}
+    roots.update(EXTRA_ROOTS)
+    return roots
+
+
+def _within(path, root):
+    return path == root or path.startswith(root + os.sep)
+
+
+def _display_path(full):
+    """How to refer to a resolved path when talking back to the model:
+    relative to whichever accessible root contains it, so a file on the
+    desktop reads as 'Desktop/report.pdf' rather than a pile of '..'s."""
+    for label, root in accessible_roots().items():
+        if _within(full, root):
+            rel = os.path.relpath(full, root)
+            return rel if label == "workspace" else f"{label}/{rel}".replace(os.sep, "/")
+    return full
+
+
 def _resolve_path(relative_path):
-    """Resolve `relative_path` inside WORKSPACE_DIR, refusing anything
-    that would escape it (absolute paths, `..` traversal, symlinked
-    escapes). This is the actual sandbox -- every file tool goes through it."""
-    if not relative_path or os.path.isabs(relative_path):
-        raise ValueError("path must be relative (no leading '/'), e.g. 'notes.txt'")
-    full = os.path.realpath(os.path.join(WORKSPACE_DIR, relative_path))
+    """Resolve a tool-supplied path to a real path the tools may touch.
+
+    Paths resolve inside WORKSPACE_DIR by default, refusing anything that
+    would escape it (`..` traversal, symlinked escapes). If extra roots are
+    configured (see _discover_extra_roots), a path may also resolve inside
+    one of those -- either as an absolute path, or prefixed with the root's
+    name, e.g. 'Desktop/report.pdf'. This is the actual sandbox: every file
+    tool goes through it."""
+    if not relative_path:
+        raise ValueError("path is required, e.g. 'notes.txt'")
+
     workspace_real = os.path.realpath(WORKSPACE_DIR)
-    if full != workspace_real and not full.startswith(workspace_real + os.sep):
-        raise ValueError(f"'{relative_path}' resolves outside the workspace directory")
+    allowed = [workspace_real] + list(EXTRA_ROOTS.values())
+
+    def _reject(described):
+        options = ", ".join(f"'{name}'" for name in accessible_roots())
+        raise ValueError(
+            f"{described} is outside the folders these tools may use ({options}). "
+            "To allow more, set ALLOW_USER_FOLDERS=true (adds Desktop, Documents, "
+            "Downloads) or EXTRA_TOOL_DIRS to specific folders, then restart."
+        )
+
+    if os.path.isabs(relative_path) or (os.name == "nt" and re.match(r"^[A-Za-z]:", relative_path)):
+        full = os.path.realpath(os.path.expanduser(relative_path))
+        if not any(_within(full, root) for root in allowed):
+            _reject(f"'{relative_path}'")
+        return full
+
+    # 'Desktop/report.pdf' -- first segment names one of the extra roots.
+    head, _, tail = relative_path.replace("\\", "/").partition("/")
+    if tail and head in EXTRA_ROOTS:
+        root = EXTRA_ROOTS[head]
+        full = os.path.realpath(os.path.join(root, tail))
+        if not _within(full, root):
+            _reject(f"'{relative_path}'")
+        return full
+
+    full = os.path.realpath(os.path.join(WORKSPACE_DIR, relative_path))
+    if not _within(full, workspace_real):
+        _reject(f"'{relative_path}'")
     return full
 
 
@@ -339,7 +439,7 @@ def proofread_pdf(path, output_path=None, check_grammar=True):
     doc.save(out_full)
     doc.close()
 
-    out_rel = os.path.relpath(out_full, WORKSPACE_DIR)
+    out_rel = _display_path(out_full)
     if not spelling_flagged and not grammar_flagged:
         summary = f"No likely spelling or grammar issues found. Saved an unmarked copy to {out_rel}."
     else:

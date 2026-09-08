@@ -1,7 +1,11 @@
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 from utils.foundry_client import query_foundry
-from utils.embeddings import embed as embed_text, embed_batch as embed_texts
+from utils.embeddings import (
+    embed as embed_text,
+    embed_batch as embed_texts,
+    dimension as embedding_dimension,
+)
 from utils.tts import synthesize_to_file, warm_up as warm_up_tts
 from utils.web_search import search_web  # optional for online use
 from utils.doc_parser import parse_document
@@ -34,12 +38,60 @@ chroma_client = PersistentClient(
     settings=Settings(anonymized_telemetry=False),
 )
 # A ChromaDB collection is locked to the vector size of whatever was first
-# written to it, and this app has two embedding backends with different
-# sizes (see utils/embeddings.py). Switching backends against an existing
-# collection therefore fails on write -- CHROMA_COLLECTION lets you point
-# at a fresh one instead of deleting chroma_store/ and losing history.
+# written to it, and this app's embedding backends produce different sizes
+# (see utils/embeddings.py). Writing 384-dim vectors into a collection
+# built at 768 just fails, which silently kills memory and document search.
+#
+# So the collection is chosen to match the active embedder rather than
+# being fixed up front: an existing compatible collection is reused as-is
+# (nobody's history gets orphaned), and a mismatch transparently moves to a
+# per-dimension collection instead of erroring on every single write. This
+# is resolved lazily on first use because it needs one embedding call to
+# learn the vector size, and startup shouldn't block on that.
 COLLECTION_NAME = os.environ.get("CHROMA_COLLECTION", "chat_memory")
-collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
+
+_collection = None
+_collection_lock = threading.Lock()
+
+def get_collection():
+    """The ChromaDB collection matching the active embedding backend, or
+    None if embeddings aren't working at all (callers degrade rather than
+    crash -- chat still works without memory)."""
+    global _collection
+    if _collection is not None:
+        return _collection
+
+    with _collection_lock:
+        if _collection is not None:
+            return _collection
+        try:
+            dim = embedding_dimension()
+        except Exception as e:
+            print(f"[Memory unavailable, continuing without it: {e}]")
+            return None
+
+        base = chroma_client.get_or_create_collection(COLLECTION_NAME)
+        existing_dim = None
+        try:
+            if base.count() > 0:
+                peeked = (base.peek(limit=1) or {}).get("embeddings")
+                if peeked is not None and len(peeked) > 0:
+                    existing_dim = len(peeked[0])
+        except Exception:
+            pass  # can't tell -- assume compatible and let a write say otherwise
+
+        if existing_dim is None or existing_dim == dim:
+            _collection = base
+        else:
+            name = f"{COLLECTION_NAME}_{dim}"
+            print(
+                f"[Memory: '{COLLECTION_NAME}' holds {existing_dim}-dimension vectors but the "
+                f"current embedding model produces {dim}. Using '{name}' instead -- the old "
+                f"collection is left untouched, so restoring the previous embedding model "
+                f"brings that history back.]"
+            )
+            _collection = chroma_client.get_or_create_collection(name)
+        return _collection
 
 # Initialize Whisper model
 whisper_model = whisper.load_model("base")  # or "small", "medium", "large"
@@ -115,6 +167,26 @@ def build_ambient_context():
     user = os.environ.get("USERNAME") or os.environ.get("USER")
     if user:
         lines.append(f"User: {user}.")
+
+    # Which folders the file tools can actually touch. Without this the
+    # model guesses -- it told a user their desktop file "does not exist in
+    # the local workspace" and offered to copy it, which it had no way to do.
+    roots = local_tools.accessible_roots()
+    if len(roots) > 1:
+        listed = ", ".join(f"{label}/ ({path})" for label, path in roots.items())
+        lines.append(
+            f"File tools can read and write in these folders: {listed}. Refer to files "
+            f"by a path starting with the folder name, e.g. 'Desktop/report.pdf'."
+        )
+    else:
+        lines.append(
+            "File tools can only read and write inside the workspace folder "
+            f"({roots['workspace']}); files elsewhere on this machine, including the "
+            "desktop, are not reachable. If the user asks about a file outside it, say so "
+            "and tell them to either move the file there or restart the app with "
+            "ALLOW_USER_FOLDERS=true -- don't offer to copy it yourself, you can't."
+        )
+
     lines.append(
         "These facts are current -- use them directly rather than guessing or "
         "saying you don't have access to the date, and don't call a tool just "
@@ -198,21 +270,11 @@ def split_thinking(raw_response):
 
     return answer, thinking
 
-def _describe_add_error(e):
-    """ChromaDB's dimension-mismatch error is the one memory failure with a
-    specific, actionable fix, so spell it out rather than printing a raw
-    exception the user has to decode."""
-    message = str(e)
-    if "dimension" in message.lower():
-        return (
-            f"{message}\n"
-            "  -> This collection was built with a different embedding model than the one "
-            "now in use (see utils/embeddings.py). Either restore the original embedding "
-            "model, or set CHROMA_COLLECTION to a new name to start a fresh collection."
-        )
-    return message
-
 def save_to_memory(role, text, session_id):
+    store = get_collection()
+    if store is None:
+        return
+
     try:
         embedding = embed_text(text)
     except Exception as e:
@@ -223,14 +285,14 @@ def save_to_memory(role, text, session_id):
     timestamp = datetime.datetime.now().isoformat()
 
     try:
-        collection.add(
+        store.add(
             documents=[text],
             embeddings=[embedding],
             ids=[doc_id],
             metadatas=[{"role": role, "session_id": session_id, "timestamp": timestamp}]
         )
     except Exception as e:
-        print(f"[Memory error, turn not saved: {_describe_add_error(e)}]")
+        print(f"[Memory error, turn not saved: {e}]")
 
 def ingest_document_chunks(chunks, session_id):
     """Embeds and stores all of a document's chunks in one batch instead
@@ -244,6 +306,10 @@ def ingest_document_chunks(chunks, session_id):
     a background thread (see /upload) so the HTTP request returns
     immediately rather than the browser hanging until every chunk of a
     large document is indexed."""
+    store = get_collection()
+    if store is None:
+        return
+
     try:
         embeddings = embed_texts(chunks)
     except Exception as e:
@@ -255,16 +321,20 @@ def ingest_document_chunks(chunks, session_id):
     metadatas = [{"role": "document", "session_id": session_id, "timestamp": timestamp} for _ in chunks]
 
     try:
-        collection.add(documents=chunks, embeddings=embeddings, ids=ids, metadatas=metadatas)
+        store.add(documents=chunks, embeddings=embeddings, ids=ids, metadatas=metadatas)
     except Exception as e:
-        print(f"[Memory error, document not stored: {_describe_add_error(e)}]")
+        print(f"[Memory error, document not stored: {e}]")
 
 def get_conversation_history(session_id, limit=MAX_HISTORY_MESSAGES):
     """The actual chronological back-and-forth for this session, so the
     model can follow up on earlier turns -- not a semantic search, which
     misses follow-ups that don't share vocabulary with earlier messages."""
+    store = get_collection()
+    if store is None:
+        return []
+
     try:
-        results = collection.get(
+        results = store.get(
             where={"$and": [{"session_id": session_id}, {"role": {"$in": ["user", "assistant"]}}]},
         )
     except Exception as e:
@@ -277,6 +347,10 @@ def get_conversation_history(session_id, limit=MAX_HISTORY_MESSAGES):
 
 def retrieve_document_context(query, session_id, top_k=3):
     """Semantic search over this session's uploaded documents only."""
+    store = get_collection()
+    if store is None:
+        return ""
+
     try:
         query_embedding = embed_text(query)
     except Exception as e:
@@ -284,7 +358,7 @@ def retrieve_document_context(query, session_id, top_k=3):
         return ""
 
     try:
-        results = collection.query(
+        results = store.query(
             query_embeddings=[query_embedding],
             n_results=top_k,
             where={"$and": [{"session_id": session_id}, {"role": "document"}]},
