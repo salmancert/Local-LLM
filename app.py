@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
-from utils.foundry_client import query_foundry, foundry_embed, foundry_embed_batch
+from utils.foundry_client import query_foundry
+from utils.embeddings import embed as embed_text, embed_batch as embed_texts
 from utils.tts import synthesize_to_file, warm_up as warm_up_tts
 from utils.web_search import search_web  # optional for online use
 from utils.doc_parser import parse_document
@@ -31,7 +32,13 @@ chroma_client = PersistentClient(
     path="chroma_store",
     settings=Settings(anonymized_telemetry=False),
 )
-collection = chroma_client.get_or_create_collection("chat_memory")
+# A ChromaDB collection is locked to the vector size of whatever was first
+# written to it, and this app has two embedding backends with different
+# sizes (see utils/embeddings.py). Switching backends against an existing
+# collection therefore fails on write -- CHROMA_COLLECTION lets you point
+# at a fresh one instead of deleting chroma_store/ and losing history.
+COLLECTION_NAME = os.environ.get("CHROMA_COLLECTION", "chat_memory")
+collection = chroma_client.get_or_create_collection(COLLECTION_NAME)
 
 # Initialize Whisper model
 whisper_model = whisper.load_model("base")  # or "small", "medium", "large"
@@ -162,22 +169,39 @@ def split_thinking(raw_response):
 
     return answer, thinking
 
+def _describe_add_error(e):
+    """ChromaDB's dimension-mismatch error is the one memory failure with a
+    specific, actionable fix, so spell it out rather than printing a raw
+    exception the user has to decode."""
+    message = str(e)
+    if "dimension" in message.lower():
+        return (
+            f"{message}\n"
+            "  -> This collection was built with a different embedding model than the one "
+            "now in use (see utils/embeddings.py). Either restore the original embedding "
+            "model, or set CHROMA_COLLECTION to a new name to start a fresh collection."
+        )
+    return message
+
 def save_to_memory(role, text, session_id):
     try:
-        embedding = foundry_embed(text)
+        embedding = embed_text(text)
     except Exception as e:
-        print(f"[Foundry embedding error, skipping memory save: {e}]")
+        print(f"[Embedding error, skipping memory save: {e}]")
         return
 
     doc_id = str(uuid.uuid4())
     timestamp = datetime.datetime.now().isoformat()
 
-    collection.add(
-        documents=[text],
-        embeddings=[embedding],
-        ids=[doc_id],
-        metadatas=[{"role": role, "session_id": session_id, "timestamp": timestamp}]
-    )
+    try:
+        collection.add(
+            documents=[text],
+            embeddings=[embedding],
+            ids=[doc_id],
+            metadatas=[{"role": role, "session_id": session_id, "timestamp": timestamp}]
+        )
+    except Exception as e:
+        print(f"[Memory error, turn not saved: {_describe_add_error(e)}]")
 
 def ingest_document_chunks(chunks, session_id):
     """Embeds and stores all of a document's chunks in one batch instead
@@ -192,9 +216,9 @@ def ingest_document_chunks(chunks, session_id):
     immediately rather than the browser hanging until every chunk of a
     large document is indexed."""
     try:
-        embeddings = foundry_embed_batch(chunks)
+        embeddings = embed_texts(chunks)
     except Exception as e:
-        print(f"[Foundry embedding error, document not stored in memory: {e}]")
+        print(f"[Embedding error, document not stored in memory: {e}]")
         return
 
     ids = [str(uuid.uuid4()) for _ in chunks]
@@ -204,7 +228,7 @@ def ingest_document_chunks(chunks, session_id):
     try:
         collection.add(documents=chunks, embeddings=embeddings, ids=ids, metadatas=metadatas)
     except Exception as e:
-        print(f"[Memory error, document not stored: {e}]")
+        print(f"[Memory error, document not stored: {_describe_add_error(e)}]")
 
 def get_conversation_history(session_id, limit=MAX_HISTORY_MESSAGES):
     """The actual chronological back-and-forth for this session, so the
@@ -225,9 +249,9 @@ def get_conversation_history(session_id, limit=MAX_HISTORY_MESSAGES):
 def retrieve_document_context(query, session_id, top_k=3):
     """Semantic search over this session's uploaded documents only."""
     try:
-        query_embedding = foundry_embed(query)
+        query_embedding = embed_text(query)
     except Exception as e:
-        print(f"[Foundry embedding error, skipping document context: {e}]")
+        print(f"[Embedding error, skipping document context: {e}]")
         return ""
 
     try:

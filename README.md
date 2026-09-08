@@ -20,6 +20,7 @@ The assistant leverages local language models through [Microsoft Foundry Local](
 └── utils/              # Utility modules
     ├── doc_parser.py       # Document parsing functionality
     ├── embedding_store.py  # Standalone ChromaDB + sentence-transformers helper
+    ├── embeddings.py       # Embedding backend: Foundry Local, with an in-process fallback
     ├── foundry_client.py   # Client for local Foundry Local inference/embeddings
     ├── local_tools.py       # Native tools: spreadsheets, Word, PDF, notepad, archives, web fetch, calc, email, shell
     ├── mcp_manager.py       # Generic MCP client -- connects configured tool servers
@@ -73,8 +74,11 @@ All configuration is via environment variables; sensible local defaults are used
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `FOUNDRY_MODEL` | `phi-4-mini` | Foundry Local catalog alias used for chat completions. 3.8B, a generation newer than the previous default (qwen2.5-1.5b) and built with native tool calling as a first-class capability -- worth it now that tool calling/MCP/Workforce all depend on the model reliably deciding when to call a tool. It's larger, so not literally faster in tokens/sec on identical hardware; "faster" here means staying CPU-practical rather than jumping to a 7B+ model. Override to trade back down for raw speed (`qwen2.5-0.5b`/`qwen2.5-1.5b`) or up for capability (`qwen2.5-7b`, `phi-4`) |
-| `FOUNDRY_EMBEDDING_MODEL` | `qwen3-embedding-0.6b` | Foundry Local catalog alias used for embeddings |
+| `FOUNDRY_MODEL` | `qwen2.5-7b` | Foundry Local catalog alias used for chat completions. Moved up from `phi-4-mini` (3.8B) after real-world testing showed the smaller model claiming it had done a file action without ever emitting a tool call -- tool-calling reliability scales with capability, and tools/MCP/Workforce/PDF-proofreading all depend on it. 7B is the middle ground: a real step up while still loading on a 16GB machine. Stronger: `phi-4`, `qwen2.5-14b`, or `gpt-oss-20b` (Microsoft's own pick for agentic tool-calling work, but effectively needs a capable GPU). Faster: `qwen2.5-1.5b`, `qwen2.5-0.5b`. If the alias you set isn't in your machine's catalog, the app logs that and falls back to the best one that is, rather than failing |
+| `FOUNDRY_EMBEDDING_MODEL` | `qwen3-embedding-0.6b` | Foundry Local catalog alias used for embeddings. If it (and the other known embedding aliases) aren't in your catalog, the app falls back to a small in-process embedder -- see Embeddings below |
+| `EMBEDDING_BACKEND` | `auto` | `auto` (use Foundry Local, fall back to in-process if unavailable), `foundry` (require Foundry Local -- error rather than fall back), or `local` (always use the in-process model, never call Foundry Local for embeddings) |
+| `FALLBACK_EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | sentence-transformers model used when the fallback backend is active |
+| `CHROMA_COLLECTION` | `chat_memory` | ChromaDB collection name. Point at a new name if you switch embedding backends -- see Embeddings below |
 | `FOUNDRY_ENDPOINT` | *(auto-discovered)* | Overrides the endpoint instead of discovering it via the SDK (e.g. a remote Foundry Local instance) |
 | `FOUNDRY_API_KEY` | *(none)* | API key to send when `FOUNDRY_ENDPOINT` is set |
 | `TTS_ENGINE` | `auto` | `auto` (use Kokoro if installed, else pyttsx3), `kokoro` (natural voice), or `pyttsx3` (always available, skips Kokoro) |
@@ -123,6 +127,21 @@ Every `/chat` response is synthesized to a local WAV file and returned as `audio
 - **pyttsx3** (fallback) -- uses the OS's built-in voices. Robotic-sounding but lightweight, no model files, and always available, so it's what keeps voice replies working if Kokoro fails to load for any reason (e.g. the model files are missing or `kokoro-onnx` isn't installed).
 
 If TTS fails entirely, the frontend falls back to the browser's built-in `speechSynthesis` API.
+
+### Embeddings (and what happens when Foundry Local can't do them)
+
+Conversation memory and document search both need embeddings. Those normally come from Foundry Local's embedding model, but embeddings are a comparatively recent Foundry Local addition, and real-world testing hit the case where **the configured embedding model simply isn't in that machine's catalog** — which silently disabled memory and document search entirely, since every embedding call failed. `utils/embeddings.py` fixes that with two layers:
+
+1. **Catalog-aware model selection** (`utils/foundry_client.py`). The Foundry Local SDK can list the catalog *without downloading anything* (`FoundryLocalManager()` with no alias, then `list_catalog_models()`), so the app now checks whether the alias you asked for actually exists before using it. If it doesn't, it walks a fallback list, and for embeddings it will also accept any catalog model whose task looks like an embedding task. It logs exactly what it picked and why. This also fixes a bad failure mode in the old code: `get_model_info()` returns `None` (it does not raise) for an unknown alias, so `get_model_info(alias).id` blew up with an opaque `AttributeError` instead of saying "that model isn't in your catalog."
+2. **An in-process fallback embedder.** If the catalog has no embedding model at all — or Foundry embeddings fail for any other reason — the app falls back to `sentence-transformers` running in-process (`all-MiniLM-L6-v2` by default: 384-dim, ~80MB, CPU-fast). `sentence-transformers` was already a dependency, so this adds no new package. The choice is lazy and sticky: nothing is probed at startup, the first embedding call decides, and once it falls back it stays fallen back for the life of the process.
+
+Force either backend with `EMBEDDING_BACKEND=foundry` (error instead of falling back) or `EMBEDDING_BACKEND=local` (never call Foundry Local for embeddings at all).
+
+**One caveat, stated plainly:** the fallback model's weights download from Hugging Face on first use, then cache and run offline forever after. That first download is the one moment this app touches the network for a core feature — unlike Kokoro TTS, whose weights are committed to this repo precisely to avoid that. If the machine is permanently offline, pre-cache the model (or copy an existing `HF_HOME` cache in) before relying on the fallback.
+
+**Switching backends breaks an existing collection.** A ChromaDB collection is locked to the vector size first written to it, and the two backends differ (1024-dim vs 384-dim), so writing fallback vectors into a collection built from Foundry vectors fails with a dimension-mismatch error. The app detects that specific error and prints what to do rather than a raw traceback: either restore the original embedding model, or set `CHROMA_COLLECTION` to a new name to start fresh without deleting `chroma_store/` and losing your history.
+
+**Testing note:** the catalog-selection logic and the backend-fallback control flow were both tested directly against the production code (5 catalog scenarios including the exact reported bug; 7 fallback scenarios covering automatic switching, stickiness, order preservation, both `EMBEDDING_BACKEND` pins, and empty input). What was *not* exercised in this project's dev sandbox is the real `sentence-transformers` model load itself — installing torch exceeded the sandbox's time budget — so that one step is stubbed in the tests and relies on `all-MiniLM-L6-v2` being the single most widely used model in that library.
 
 ### Conversation Memory
 

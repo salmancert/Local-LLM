@@ -16,24 +16,52 @@ from types import SimpleNamespace
 # unrelated in-process native binding API (no `.endpoint`/`.api_key`), so
 # an unpinned install would silently break this module.
 
-# phi-4-mini (3.8B) over the previous default qwen2.5-1.5b (1.5B): a
-# generation newer, meaningfully stronger per Microsoft's own benchmarks
-# (reasoning/math/code), and specifically built with native function/tool
-# calling as a first-class capability -- which matters a lot here now that
-# tool calling, MCP, and Workforce all depend on the model reliably
-# deciding when and how to call a tool. It's larger, so it is not faster
-# in raw tokens/sec on identical hardware than 1.5B -- "faster" here means
-# staying in the small/CPU-practical tier of its generation (Microsoft's
-# own "lightweight footprint" positioning) rather than jumping to a 7B+
-# model, and Foundry Local still auto-selects the fastest available
-# hardware variant (CPU/GPU/NPU) for whichever alias is requested.
-# Override with FOUNDRY_MODEL if you'd rather trade capability for raw
-# speed (qwen2.5-0.5b/1.5b) or capability for size (qwen2.5-7b, phi-4).
-DEFAULT_CHAT_MODEL = os.environ.get("FOUNDRY_MODEL", "phi-4-mini")
-# "nomic-embed-text" (the previous default) is an Ollama model name and was
-# never in Foundry Local's catalog -- every embedding call failed. The
-# correct catalog alias, per Microsoft's own docs, is "qwen3-embedding-0.6b".
+# Which chat model to use. The default moved up from phi-4-mini (3.8B) to
+# qwen2.5-7b after real-world testing showed the smaller model failing at
+# the thing this app leans on hardest: it would answer "I've highlighted
+# the spelling errors" without ever emitting a tool call, so no file was
+# produced. Tool-calling reliability scales with model capability, and
+# every headline feature here (tools, MCP, Workforce, the PDF grammar
+# pass) depends on the model actually deciding to call a tool.
+#
+# 7B is the deliberate middle: a real step up from 3.8B while still
+# loading on a 16GB machine, where 14B+ starts to hurt. If you have the
+# hardware, FOUNDRY_MODEL=phi-4 or qwen2.5-14b are stronger again, and
+# gpt-oss-20b stronger still (Microsoft's own recommendation for agentic
+# tool-calling work, but it effectively needs a capable GPU). Going the
+# other way, qwen2.5-1.5b / qwen2.5-0.5b trade capability for raw speed.
+DEFAULT_CHAT_MODEL = os.environ.get("FOUNDRY_MODEL", "qwen2.5-7b")
+
+# Tried in order when the configured chat model isn't in this machine's
+# catalog. Roughly ordered "most capable that's still locally practical"
+# first, with small models at the end so the app still runs on modest
+# hardware rather than failing outright.
+CHAT_MODEL_FALLBACKS = [
+    "qwen2.5-7b",
+    "phi-4",
+    "mistral-7b-v0.2",
+    "qwen2.5-14b",
+    "phi-4-mini",
+    "phi-3.5-mini",
+    "qwen2.5-1.5b",
+    "qwen2.5-0.5b",
+]
+
+# "nomic-embed-text" (the original default here) is an Ollama model name and
+# was never in Foundry Local's catalog -- every embedding call failed.
+# "qwen3-embedding-0.6b" is the alias in Microsoft's own embedding docs, but
+# real-world testing found it missing from at least one user's catalog:
+# embeddings are a relatively recent Foundry Local addition, so whether any
+# embedding model is present depends on the installed version. Hence the
+# fallback list, and -- when the catalog has no embedding model at all --
+# utils/embeddings.py falling back to a small in-process model instead.
 DEFAULT_EMBEDDING_MODEL = os.environ.get("FOUNDRY_EMBEDDING_MODEL", "qwen3-embedding-0.6b")
+
+EMBEDDING_MODEL_FALLBACKS = [
+    "qwen3-embedding-0.6b",
+    "all-minilm-l6-v2",
+    "bge-small-en-v1.5",
+]
 
 
 @lru_cache(maxsize=None)
@@ -45,11 +73,65 @@ def _get_manager(alias):
 
 
 @lru_cache(maxsize=None)
+def _get_catalog_manager():
+    """A manager bound to no particular model, so the catalog can be read
+    without downloading anything -- `alias_or_model_id` is optional in the
+    SDK, and passing one triggers a (potentially multi-GB) download."""
+    from foundry_local import FoundryLocalManager
+    return FoundryLocalManager()
+
+
+@lru_cache(maxsize=None)
+def _catalog_aliases():
+    """{alias: FoundryModelInfo} for everything in this machine's catalog.
+    Empty dict if the catalog can't be read, so callers degrade to just
+    trying the configured alias directly rather than failing here."""
+    try:
+        models = _get_catalog_manager().list_catalog_models()
+    except Exception as e:
+        print(f"[Foundry: couldn't read the model catalog: {e}]")
+        return {}
+
+    catalog = {}
+    for info in models:
+        # Several hardware variants can share one alias -- first wins, which
+        # matches Foundry Local's own "alias picks the best variant" behavior.
+        if info.alias and info.alias not in catalog:
+            catalog[info.alias] = info
+    return catalog
+
+
+def _resolve_alias(preferred, fallbacks, kind):
+    """The first of `preferred` + `fallbacks` actually present in the
+    catalog. Returns None if none of them are (and, for embeddings, that's
+    a normal outcome -- see utils/embeddings.py). Note get_model_info()
+    returns None rather than raising for an unknown alias, which is why
+    the old `get_model_info(alias).id` blew up with an opaque
+    AttributeError when an alias wasn't in the catalog."""
+    catalog = _catalog_aliases()
+    candidates = [preferred] + [a for a in fallbacks if a != preferred]
+
+    if not catalog:
+        return preferred  # catalog unreadable -- just try what was asked for
+
+    for alias in candidates:
+        if alias in catalog:
+            if alias != preferred:
+                print(f"[Foundry: '{preferred}' isn't in this machine's catalog, using '{alias}' instead]")
+            return alias
+
+    available = ", ".join(sorted(catalog)) or "(none)"
+    print(f"[Foundry: none of {candidates} are in the catalog for {kind}. Available: {available}]")
+    return None
+
+
+@lru_cache(maxsize=None)
 def _get_client_and_model_id(alias):
     import openai
 
     # Explicit override for advanced setups (e.g. a remote Foundry Local
-    # instance, or a manually chosen port).
+    # instance, or a manually chosen port). Skips catalog resolution
+    # entirely -- the remote end decides what the alias means.
     endpoint = os.environ.get("FOUNDRY_ENDPOINT")
     if endpoint:
         api_key = os.environ.get("FOUNDRY_API_KEY", "") or "not-needed"
@@ -60,10 +142,16 @@ def _get_client_and_model_id(alias):
         base_url=manager.endpoint,
         api_key=manager.api_key or "not-needed",
     )
-    # The catalog alias (e.g. "qwen2.5-1.5b") isn't itself a valid model id
+    # The catalog alias (e.g. "qwen2.5-7b") isn't itself a valid model id
     # for the inference API -- resolve it to the concrete loaded model id.
-    model_id = manager.get_model_info(alias).id
-    return client, model_id
+    info = manager.get_model_info(alias)
+    if info is None:
+        raise RuntimeError(
+            f"Model '{alias}' is not in this machine's Foundry Local catalog. "
+            f"Run 'foundry model list' to see what is available, then set "
+            f"FOUNDRY_MODEL (or FOUNDRY_EMBEDDING_MODEL) accordingly."
+        )
+    return client, info.id
 
 
 def query_foundry(messages, model=None, max_tokens=None, tools=None, tool_choice=None):
@@ -79,7 +167,13 @@ def query_foundry(messages, model=None, max_tokens=None, tools=None, tool_choice
     can detect and act on tool calls. On a connection error, returns a
     stand-in object with `.content` set to an error string and
     `.tool_calls` set to None, so callers can handle both cases uniformly."""
-    alias = model or DEFAULT_CHAT_MODEL
+    alias = model or resolve_chat_model()
+    if alias is None:
+        return SimpleNamespace(
+            content="[No chat model available in this machine's Foundry Local catalog -- "
+                    "run 'foundry model list' and set FOUNDRY_MODEL to one of them.]",
+            tool_calls=None,
+        )
     try:
         client, model_id = _get_client_and_model_id(alias)
         kwargs = {"model": model_id, "messages": messages}
@@ -94,8 +188,41 @@ def query_foundry(messages, model=None, max_tokens=None, tools=None, tool_choice
         return SimpleNamespace(content=f"[Foundry connection error: {e}]", tool_calls=None)
 
 
+@lru_cache(maxsize=1)
+def resolve_chat_model():
+    """The chat model alias to actually use on this machine: the configured
+    one if the catalog has it, otherwise the best available fallback."""
+    if os.environ.get("FOUNDRY_ENDPOINT"):
+        return DEFAULT_CHAT_MODEL  # remote endpoint -- no local catalog to check
+    return _resolve_alias(DEFAULT_CHAT_MODEL, CHAT_MODEL_FALLBACKS, "chat")
+
+
+@lru_cache(maxsize=1)
+def resolve_embedding_model():
+    """The embedding model alias to use, or None if this machine's catalog
+    has no embedding model at all -- a normal outcome on Foundry Local
+    versions predating embedding support. utils/embeddings.py treats None
+    as "use the in-process fallback embedder instead"."""
+    if os.environ.get("FOUNDRY_ENDPOINT"):
+        return DEFAULT_EMBEDDING_MODEL
+    alias = _resolve_alias(DEFAULT_EMBEDDING_MODEL, EMBEDDING_MODEL_FALLBACKS, "embeddings")
+    if alias is not None:
+        return alias
+
+    # Nothing from the known-alias list is present. Before giving up, take
+    # anything in the catalog whose task looks like an embedding task --
+    # the catalog grows over time and may carry a model we've never heard of.
+    for candidate, info in sorted(_catalog_aliases().items()):
+        if "embed" in (getattr(info, "task", "") or "").lower():
+            print(f"[Foundry: using catalog embedding model '{candidate}']")
+            return candidate
+    return None
+
+
 def foundry_embed(text, model=None):
-    alias = model or DEFAULT_EMBEDDING_MODEL
+    alias = model or resolve_embedding_model()
+    if alias is None:
+        raise RuntimeError("no embedding model available in the Foundry Local catalog")
     client, model_id = _get_client_and_model_id(alias)
     response = client.embeddings.create(model=model_id, input=text)
     return response.data[0].embedding
@@ -117,7 +244,9 @@ def foundry_embed_batch(texts, model=None):
     return results in request order)."""
     if not texts:
         return []
-    alias = model or DEFAULT_EMBEDDING_MODEL
+    alias = model or resolve_embedding_model()
+    if alias is None:
+        raise RuntimeError("no embedding model available in the Foundry Local catalog")
     client, model_id = _get_client_and_model_id(alias)
     response = client.embeddings.create(model=model_id, input=texts)
     return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
@@ -129,8 +258,8 @@ def get_endpoint_config(chat_model=None, embedding_model=None):
     hand these to a different SDK wrapper pointed at the same local
     endpoint (e.g. utils/graph_memory.py's Graphiti client, which has its
     own OpenAI-compatible client classes)."""
-    chat_alias = chat_model or DEFAULT_CHAT_MODEL
-    embed_alias = embedding_model or DEFAULT_EMBEDDING_MODEL
+    chat_alias = chat_model or resolve_chat_model()
+    embed_alias = embedding_model or resolve_embedding_model()
 
     endpoint = os.environ.get("FOUNDRY_ENDPOINT")
     if endpoint:
@@ -141,6 +270,16 @@ def get_endpoint_config(chat_model=None, embedding_model=None):
             "chat_model_id": chat_alias,
             "embedding_model_id": embed_alias,
         }
+
+    if chat_alias is None or embed_alias is None:
+        # Graphiti needs both an LLM and an embedder against one OpenAI-
+        # compatible endpoint; it can't use utils/embeddings.py's in-process
+        # fallback, so graph memory simply stays off rather than half-working.
+        raise RuntimeError(
+            "Foundry Local's catalog is missing a "
+            f"{'chat' if chat_alias is None else 'embedding'} model, which graph "
+            "memory requires. Run 'foundry model list' to see what's available."
+        )
 
     chat_manager = _get_manager(chat_alias)
     embed_manager = _get_manager(embed_alias)
