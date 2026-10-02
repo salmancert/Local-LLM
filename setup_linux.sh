@@ -18,8 +18,8 @@ for arg in "$@"; do
 done
 
 echo "==> Installing system packages (needs sudo)"
-# tesseract-ocr: reads scanned PDFs, libreoffice-writer-nogui: reads old .doc files
-PACKAGES=(python3 python3-venv curl tesseract-ocr libreoffice-writer-nogui)
+# tesseract-ocr: reads scanned PDFs, libreoffice-*-nogui: converts old .doc and .xls files
+PACKAGES=(python3 python3-venv curl tesseract-ocr libreoffice-writer-nogui libreoffice-calc-nogui)
 if [ "$WEB_APP" = 1 ]; then
     # ffmpeg: audio decoding for Whisper, espeak-ng + alsa-utils: offline TTS used by pyttsx3
     PACKAGES+=(ffmpeg espeak-ng alsa-utils)
@@ -88,8 +88,8 @@ fi
 echo
 echo "Setup complete. Go to a folder with your files and run:"
 echo "    fin-agent                              # chat with tool calling, in the current folder"
-echo "    qcr ~/Clients/ClientName               # quality control review of one client"
-echo "    qcr ~/Clients --all                    # every client in a folder"
+echo "    qcr checklist.xlsx ~/Clients/ClientName   # fill your QCR checklist for one client"
+echo "    qcr checklist.xlsx ~/Clients --all        # one completed checklist per client"
 if [ "$WEB_APP" = 1 ]; then
     echo "Web app: source venv/bin/activate && python app.py, then open http://localhost:8000"
 fi

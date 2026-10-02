@@ -16,9 +16,9 @@ curl -fsSL https://ollama.com/install.sh | sh     # Ollama, runs as a background
 ./setup_linux.sh                                   # packages, venv, the model and the two commands
 
 cd ~/Documents/finance && fin-agent                # chat with your files, like Claude Code
-qcr ~/Clients/"Acme Ltd"                           # quality control review of one client
+qcr "QCR checklist.xlsx" ~/Clients/"Acme Ltd"     # fill your QCR checklist for a client
 ```
-`setup_linux.sh` installs `tesseract-ocr` (scanned PDFs) and `libreoffice-writer-nogui` (old `.doc`
+`setup_linux.sh` installs `tesseract-ocr` (scanned PDFs) and LibreOffice without a GUI (old `.doc`/`.xls`
 files), creates `./venv` from `requirements-agent.txt`, pulls `qwen2.5:7b`, and adds the `fin-agent`
 and `qcr` commands to `~/.local/bin` (open a new terminal if they are not found). Details:
 [Terminal Agent](#terminal-agent-for-finance-files) and
@@ -31,8 +31,7 @@ The rest of this section describes the browser chat app with voice (`app.py`), w
 .
 ├── app.py                 # Main Flask application with routing and core logic
 ├── agent.py               # Terminal agent with tool calling for finance files
-├── qcr.py                 # Quality control review of audit engagement files
-├── qcr_checklist.csv      # Default QCR checklist (ISAs (UK)); replace with your firm's
+├── qcr.py                 # Fills your QCR checklist (Excel/Word) from a client's files
 ├── offline script.py      # Utility for offline document processing and embedding
 ├── setup_linux.sh         # One-time setup script for Ubuntu/Debian
 ├── requirements.txt       # Python dependencies for the web app (includes the terminal tools)
@@ -216,68 +215,71 @@ curl -X POST -F "audio=@your_recording.wav" http://localhost:8000/upload_audio
   page, or start the app with `SERVER_TTS=0`
 
 ## Quality Control Review of Audit Files
-`qcr.py` runs a quality control (cold file) review of an audit engagement file, in the style of an
-ICAEW QAD review, entirely on your machine. It is built for doing the same exercise for many clients:
-**no client data leaves the computer** (the model runs in Ollama locally, and nothing is uploaded).
+`qcr` fills in **your own QCR checklist** (Excel or Word) for a client: for each requirement it searches
+the client's folders for evidence, decides whether the requirement is met and marks the checklist.
+Everything runs on your machine; no client data is uploaded anywhere.
 
-Put each client's audit file in its own folder (zip, Word, Excel and PDF files, as exported):
-```
-Clients/
-├── Acme Widgets Ltd/      AuditFile_2025.zip, Financial statements.pdf, ...
-└── Bloggs & Co/           ...
-```
-`qcr` is the command added by `setup_linux.sh`; it is the same as `python qcr.py` with the venv active
-(use that form on Windows).
 ```bash
-qcr ~/Clients/"Acme Widgets Ltd"                  # one client
-qcr ~/Clients --all                               # every client + a portfolio summary
-qcr ~/Clients/"Acme Widgets Ltd" --items 8,29     # re-assess selected items only
+qcr "QCR checklist.xlsx" ~/Clients/"Acme Ltd" --dry-run   # check how your checklist was understood
+qcr "QCR checklist.xlsx" ~/Clients/"Acme Ltd"             # fill it for one client
+qcr "QCR checklist.docx" ~/Clients --all                  # one completed checklist per client folder
 ```
+(`qcr` is added by `setup_linux.sh`; elsewhere use `python qcr.py ...` with the venv active.)
 
-**What it does for each client**
-1. Unpacks zip files (including zips inside zips) into `_extracted/`, and reads Word (`.docx`, and `.doc`
-   via LibreOffice), Excel, PDF (scanned pages via Tesseract OCR) and text files. Files that cannot be read,
-   such as password-protected zips, are listed so you know what the review did not cover.
-2. For each checklist item, finds the most relevant passages in the file and asks the local model for a
-   status (Satisfactory / Finding / Not evidenced / Not applicable), severity, finding, quoted evidence and
-   recommendation. **Every quote is checked against the documents**; quotes the model made up are
-   marked `[UNVERIFIED]`.
-3. Writes to `<client>/_qcr/`:
-   - `QCR_<client>_<date>.xlsx`: Summary, Checklist (with blank *Reviewer conclusion* / *Reviewer
-     comments* columns for sign-off), Evidence (file and page of each quote) and Files reviewed
-   - `QCR_<client>_<date>.docx`: a draft review report with findings ordered by severity, items not
-     evidenced and unreadable files
-   - with `--all`, `QCR_portfolio_<date>.xlsx` in the parent folder: one row per client
+**How it works**
+1. **Reads your checklist** as it is laid out. In Excel it finds the header row on each sheet and the
+   columns for the question/requirement, the answer (`Y/N/NA`, `Complied`, `Status`...), comments and
+   working paper reference; short rows such as "Planning" or "Going concern" are treated as section
+   headings. In Word it does the same for each table (checklists must be in tables). Old `.xls`/`.doc`
+   checklists are converted with LibreOffice.
+2. **Reads the client's folders**: unpacks zips (including zips inside zips), and reads Word, Excel,
+   PDF (scanned pages via OCR) and text files in every sub-folder.
+3. **For each requirement**: the model suggests the words the evidence would contain (so terse
+   questions still find the right working papers), the most relevant passages are found, and the
+   model concludes Satisfactory / Finding / Not evidenced / N/A with quotes. **Every quote is checked
+   against the files**; a quote that cannot be found is marked `[UNVERIFIED]`.
+4. **Marks a copy of your checklist** in `<client>/_qcr/<checklist> - <client> - <date>.xlsx/.docx`:
+   - answer column: `Yes` / `No` / `N/A` (or the values of your dropdown list; "not evidenced" is left
+     blank if your dropdown has no such option)
+   - comment column: `[AI: Finding (High)] ...` with a recommendation
+   - working paper reference column: the files and pages relied on, e.g.
+     `AuditFile_2025.zip › B Planning/B3 Materiality.xlsx (sheet Calc)`
+   - every cell the tool wrote is shaded **yellow**, so you can see what to review
+   
+   Your original checklist is never changed, rows you have already answered are left alone (use
+   `--overwrite` to redo them), and if your checklist has no answer or comment column, AI columns are
+   added. `files_reviewed.txt` lists every file and whether it could be read.
 
-Results are cached per item, so an interrupted review continues where it stopped and re-running is
-instant. To follow up on a finding, open the client in the interactive agent
-(`cd ~/Clients/"Acme Widgets Ltd" && fin-agent`) and ask, for example, "show me the going concern
-work and the date the financial statements were approved".
+**Options**
+| Option | Use |
+|--------|-----|
+| `--dry-run` | List the requirements, sections and columns found, without running the model |
+| `--sheet "Audit"` | Only one Excel sheet |
+| `--question-col B --answer-col C --comment-col E --evidence-col D` | Set the Excel columns yourself if they are not detected |
+| `--labels "Complied,Not complied,N/A,Not evidenced"` | Words to write in the answer column |
+| `--rows 12,15` | Only these rows (`--rows "table 2 row 4"` for Word) |
+| `--overwrite` | Also answer rows that already have an answer |
+| `--redo` | Ignore cached results and assess again |
 
-**The checklist** (`qcr_checklist.csv`) has 37 items covering acceptance and ethics, planning, execution,
-completion and reporting, referenced to ISAs (UK), the FRC Ethical Standard and ISQM (UK). It is a
-starting point, not ICAEW's own checklist: replace or extend it with your firm's (`--checklist
-file.xlsx` or `.csv`). Only a `question` column is required; `id`, `area`, `reference` and
-`search_terms` (separated by `;`, used to find the right passages) are optional but improve results.
+Results are cached per requirement in `<client>/_qcr/results.json`, so an interrupted run continues
+where it stopped and running again (for example after fixing a column) is instant.
 
-**Limitations: this is a first-pass draft for a qualified reviewer, not a review.**
-- A 7B model running locally makes mistakes. Check every conclusion against the file.
-- "Not evidenced" means no relevant text was found, not that the work was not done (it may be in a
-  scanned page, an image or a file that could not be read).
-- The grade is an indicative rule of thumb (any high-severity finding = "Significant improvement
-  required"; not graded if over a quarter of items are not evidenced). You decide the grade.
-- Speed on a CPU-only machine: roughly a minute per checklist item, so 30-60 minutes per client.
-  Run `--all` overnight for a batch. `QCR_MODEL` (default `qwen2.5:7b`) selects the model; a larger
-  model such as `qwen2.5:14b` (~9 GB RAM) gives better judgements if your machine can spare the memory.
+To follow up on an answer, open the client in the interactive agent
+(`cd ~/Clients/"Acme Ltd" && fin-agent`) and ask, for example, "show me the going concern work and the
+date the financial statements were approved".
 
-**Extra software:** `sudo apt install tesseract-ocr libreoffice-writer-nogui` (included in
-`setup_linux.sh`). On Windows install [Tesseract](https://github.com/UB-Mannheim/tesseract/wiki) and
-LibreOffice and make sure both are on the `PATH`.
+**Limitations: the output is a first pass for a qualified reviewer.**
+- A 7B model running locally makes mistakes; check every yellow cell against the file.
+- "Not evidenced" means no relevant text was found, not that the work was not done (it may be in an
+  image, a password-protected zip or a file listed as not read in `files_reviewed.txt`).
+- Speed on a CPU-only machine: roughly a minute per requirement, so run `--all` overnight for a batch.
+  `QCR_MODEL` selects the model (default `qwen2.5:7b`); `qwen2.5:14b` (~9 GB RAM) judges better if
+  your machine can spare the memory.
 
-**Confidentiality notes:** keep client folders outside this repository (the `.gitignore` also excludes
+**Confidentiality:** keep client folders outside this repository (the `.gitignore` also excludes
 `clients/`, `_qcr/` and `_extracted/` as a safeguard). The tools warn if `OLLAMA_URL` points to another
-machine. Unpacked copies in `_extracted/` and outputs in `_qcr/` live inside each client folder, so
-they are covered by the same retention and deletion policy as the client file.
+machine. Unpacked copies (`_extracted/`) and results (`_qcr/`) stay inside each client folder, under the
+same retention and deletion policy as the client file.
 
 ## Terminal Agent for Finance Files
 `agent.py` is a Claude Code style assistant that runs in your terminal on a local Ollama model.

@@ -188,16 +188,20 @@ def docx_lines(full):
 
 
 def convert_to_docx(full):
-    """Convert legacy Word (.doc) and other formats with LibreOffice. Converted copies are cached inside
-    the workspace (not the shared temp folder) so client data stays in the client's folder."""
+    return convert_document(full, "docx")
+
+
+def convert_document(full, fmt):
+    """Convert legacy Office files (.doc, .xls, ...) to `fmt` with LibreOffice. Converted copies are
+    cached inside the workspace (not the shared temp folder) so client data stays in the client's folder."""
     office = shutil.which("soffice") or shutil.which("libreoffice")
     if office is None:
         raise ToolError(f"reading {os.path.basename(full)} needs LibreOffice "
-                        "(Ubuntu: sudo apt install libreoffice-writer), or save it as .docx")
+                        f"(Ubuntu: sudo apt install libreoffice-writer-nogui), or save it as .{fmt}")
     stamp = hashlib.sha1(f"{full}:{os.path.getmtime(full)}".encode()).hexdigest()[:16]
-    target = os.path.join(CONVERTED_DIR, stamp, os.path.splitext(os.path.basename(full))[0] + ".docx")
+    target = os.path.join(CONVERTED_DIR, stamp, os.path.splitext(os.path.basename(full))[0] + "." + fmt)
     if not os.path.exists(target):
-        subprocess.run([office, "--headless", "--convert-to", "docx", "--outdir", os.path.dirname(target), full],
+        subprocess.run([office, "--headless", "--convert-to", fmt, "--outdir", os.path.dirname(target), full],
                        capture_output=True, timeout=180)
         if not os.path.exists(target):
             raise ToolError(f"LibreOffice could not convert {os.path.basename(full)}")
