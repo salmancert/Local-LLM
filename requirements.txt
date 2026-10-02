@@ -5,3 +5,7 @@ PyMuPDF
 chromadb
 openai-whisper
 pyttsx3
+# terminal agent (agent.py)
+rich
+pandas
+openpyxl

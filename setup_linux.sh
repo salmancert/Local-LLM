@@ -42,8 +42,11 @@ fi
 echo "==> Downloading Ollama models"
 ollama pull "${OLLAMA_MODEL:-mistral}"
 ollama pull nomic-embed-text
+ollama pull "${AGENT_MODEL:-qwen2.5:7b}"   # tool-calling model for agent.py
 
 echo
 echo "Setup complete. Start the assistant with:"
 echo "    source venv/bin/activate && python app.py"
 echo "then open http://localhost:8000"
+echo "or the terminal agent with:"
+echo "    source venv/bin/activate && python agent.py ~/path/to/finance-files"

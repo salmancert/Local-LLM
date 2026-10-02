@@ -8,6 +8,7 @@ The assistant leverages local language models through Ollama, maintains conversa
 ```
 .
 ├── app.py                 # Main Flask application with routing and core logic
+├── agent.py               # Terminal agent with tool calling for finance files
 ├── offline script.py      # Utility for offline document processing and embedding
 ├── setup_linux.sh         # One-time setup script for Ubuntu/Debian
 ├── requirements.txt       # Python dependencies
@@ -127,6 +128,8 @@ Optional environment variables:
 | `OLLAMA_MODEL` | `mistral` | Chat model (pull it first with `ollama pull <model>`) |
 | `WHISPER_MODEL` | `base` | Speech recognition model: `tiny`, `base`, `small`, `medium`, `large` |
 | `SERVER_TTS` | `1` | Set to `0` to stop the server from speaking replies (the browser can still read them aloud) |
+| `AGENT_MODEL` | `qwen2.5:7b` | Tool-calling model used by `agent.py` |
+| `AGENT_CTX` | `16384` | Context size in tokens for `agent.py` |
 
 ```bash
 # Linux
@@ -185,6 +188,47 @@ curl -X POST -F "audio=@your_recording.wav" http://localhost:8000/upload_audio
   and restart the browser
 - Replies are spoken twice: the server and the browser both speak. Click the Mute button in the
   page, or start the app with `SERVER_TTS=0`
+
+## Terminal Agent for Finance Files
+`agent.py` is a Claude Code style assistant that runs in your terminal on a local Ollama model.
+The model can call tools to look at your files and run calculations, so it answers from your actual
+data instead of guessing. Nothing leaves your machine.
+
+```bash
+ollama pull qwen2.5:7b                      # a model that supports tool calling (~4.7 GB)
+source venv/bin/activate                    # Windows: venv\Scripts\activate
+python agent.py ~/Documents/finance         # the folder with your statements, invoices, budgets
+```
+
+Then ask things like:
+- "Summarise my spending by category for January and flag duplicate charges"
+- "Which invoices in invoices/ are due before the end of the month, and what is the total?"
+- "Compare budget.xlsx with the actual spending in statements/ and write the result to reports/budget_vs_actual.csv"
+
+**Tools the model can use**
+
+| Tool | What it does | Asks first? |
+|------|--------------|-------------|
+| `list_files` | List files with size and date | no |
+| `read_file` | Read text, CSV, PDF and Excel files as numbered lines | no |
+| `inspect_table` | Columns, types, first rows and numeric summary of a CSV/Excel file | no |
+| `search_files` | Regex search across files, including PDFs and spreadsheets | no |
+| `run_python` | Run Python with pandas for calculations (totals, grouping, reconciliation) | yes |
+| `run_shell` | Run a shell command | yes |
+| `write_file` | Create or overwrite a file (shows a diff first) | yes |
+
+File tools are limited to the folder you start the agent in. Before `run_python`, `run_shell` or
+`write_file`, the agent shows the code or diff and waits for **y**es, **n**o, **a**lways (for that tool
+this session), or your own instruction instead. Start with `--yes` to skip the questions.
+
+**Commands:** `/help`, `/clear` (new conversation), `/model <name>`, `/auto` (toggle asking),
+`/tools`, `/exit`. End a line with `\` to continue typing on the next line; Ctrl+C stops an answer.
+Use `python agent.py -p "question"` for a single answer without the interactive prompt.
+
+**Models:** any Ollama model with tool support works, set with `--model` or `AGENT_MODEL`.
+`qwen2.5:7b` (default) is reliable at tool calling and fits in 16 GB RAM alongside its 16k-token
+context (~6 GB in total). Alternatives: `llama3.1:8b`, `qwen3:8b`. Plain `mistral` is weaker at tool
+calling. `AGENT_CTX` sets the context size (default 16384 tokens); larger uses more RAM.
 
 ## Data Flow
 The system processes user inputs through multiple stages, from text/voice input to AI response generation, maintaining context through vector embeddings.
