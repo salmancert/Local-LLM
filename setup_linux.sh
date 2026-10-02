@@ -1,14 +1,31 @@
 #!/usr/bin/env bash
 # One-time setup for Ubuntu / Debian. Run from anywhere:  ./setup_linux.sh
+#
+# Installs the terminal tools (agent.py and qcr.py) and adds two commands to ~/.local/bin:
+#   fin-agent   interactive terminal agent in the current folder (like Claude Code)
+#   qcr         quality control review of an audit file
+# Add --with-web-app to also install the browser chat app with voice (app.py).
 set -euo pipefail
 cd "$(dirname "$0")"
+REPO="$(pwd)"
+
+WEB_APP=0
+for arg in "$@"; do
+    case "$arg" in
+        --with-web-app) WEB_APP=1 ;;
+        *) echo "Unknown option: $arg (use --with-web-app or nothing)"; exit 1 ;;
+    esac
+done
 
 echo "==> Installing system packages (needs sudo)"
-# ffmpeg: audio decoding for Whisper, espeak-ng + alsa-utils: offline TTS used by pyttsx3,
 # tesseract-ocr: reads scanned PDFs, libreoffice-writer-nogui: reads old .doc files
+PACKAGES=(python3 python3-venv curl tesseract-ocr libreoffice-writer-nogui)
+if [ "$WEB_APP" = 1 ]; then
+    # ffmpeg: audio decoding for Whisper, espeak-ng + alsa-utils: offline TTS used by pyttsx3
+    PACKAGES+=(ffmpeg espeak-ng alsa-utils)
+fi
 sudo apt-get update
-sudo apt-get install -y python3 python3-venv ffmpeg espeak-ng alsa-utils curl \
-    tesseract-ocr libreoffice-writer-nogui
+sudo apt-get install -y "${PACKAGES[@]}"
 
 echo "==> Creating virtual environment in ./venv"
 python3 -m venv venv
@@ -16,15 +33,35 @@ python3 -m venv venv
 . venv/bin/activate
 pip install --upgrade pip
 
-if command -v nvidia-smi >/dev/null 2>&1; then
-    echo "==> NVIDIA GPU detected: installing PyTorch with CUDA support"
-    pip install torch
+if [ "$WEB_APP" = 1 ]; then
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        echo "==> NVIDIA GPU detected: installing PyTorch with CUDA support"
+        pip install torch
+    else
+        # The default Linux wheel bundles several GB of CUDA libraries that are useless without a GPU
+        echo "==> No NVIDIA GPU detected: installing the much smaller CPU-only PyTorch"
+        pip install torch --index-url https://download.pytorch.org/whl/cpu
+    fi
+    pip install -r requirements.txt
 else
-    # The default Linux wheel bundles several GB of CUDA libraries that are useless without a GPU
-    echo "==> No NVIDIA GPU detected: installing the much smaller CPU-only PyTorch"
-    pip install torch --index-url https://download.pytorch.org/whl/cpu
+    pip install -r requirements-agent.txt
 fi
-pip install -r requirements.txt
+
+echo "==> Adding the fin-agent and qcr commands to ~/.local/bin"
+mkdir -p "$HOME/.local/bin"
+for pair in "fin-agent:agent.py" "qcr:qcr.py"; do
+    name="${pair%%:*}"
+    script="${pair#*:}"
+    cat > "$HOME/.local/bin/$name" <<EOF
+#!/usr/bin/env bash
+exec "$REPO/venv/bin/python" "$REPO/$script" "\$@"
+EOF
+    chmod +x "$HOME/.local/bin/$name"
+done
+case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) echo "Note: ~/.local/bin is not on your PATH yet. Log out and back in (or open a new terminal)." ;;
+esac
 
 if ! command -v ollama >/dev/null 2>&1; then
     echo
@@ -42,15 +79,17 @@ if ! ollama list >/dev/null 2>&1; then
 fi
 
 echo "==> Downloading Ollama models"
-ollama pull "${OLLAMA_MODEL:-mistral}"
-ollama pull nomic-embed-text
-ollama pull "${AGENT_MODEL:-qwen2.5:7b}"   # tool-calling model for agent.py
+ollama pull "${AGENT_MODEL:-qwen2.5:7b}"   # tool-calling model for fin-agent and qcr
+if [ "$WEB_APP" = 1 ]; then
+    ollama pull "${OLLAMA_MODEL:-mistral}"
+    ollama pull nomic-embed-text
+fi
 
 echo
-echo "Setup complete. Start the assistant with:"
-echo "    source venv/bin/activate && python app.py"
-echo "then open http://localhost:8000"
-echo "or the terminal agent with:"
-echo "    source venv/bin/activate && python agent.py ~/path/to/finance-files"
-echo "or a quality control review of a client's audit file with:"
-echo "    source venv/bin/activate && python qcr.py ~/path/to/Clients/ClientName"
+echo "Setup complete. Go to a folder with your files and run:"
+echo "    fin-agent                              # chat with tool calling, in the current folder"
+echo "    qcr ~/Clients/ClientName               # quality control review of one client"
+echo "    qcr ~/Clients --all                    # every client in a folder"
+if [ "$WEB_APP" = 1 ]; then
+    echo "Web app: source venv/bin/activate && python app.py, then open http://localhost:8000"
+fi

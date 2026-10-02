@@ -4,6 +4,28 @@ This project implements a web-based conversational AI assistant that combines do
 
 The assistant leverages local language models through Ollama, maintains conversation context using ChromaDB for semantic search, and supports voice interaction through offline text-to-speech and speech recognition capabilities. The system is designed to work primarily offline, making it suitable for environments with limited internet connectivity while still providing optional web search functionality.
 
+## Quick Start on Linux: terminal tools only
+On Linux you can use just the terminal tools: a Claude Code style agent with tool calling (`fin-agent`)
+and the audit file quality control review (`qcr`). They need no voice, web server or PyTorch: the
+install is about 300 MB of Python packages plus the model.
+
+```bash
+git clone https://github.com/salmancert/Local-LLM.git
+cd Local-LLM
+curl -fsSL https://ollama.com/install.sh | sh     # Ollama, runs as a background service
+./setup_linux.sh                                   # packages, venv, the model and the two commands
+
+cd ~/Documents/finance && fin-agent                # chat with your files, like Claude Code
+qcr ~/Clients/"Acme Ltd"                           # quality control review of one client
+```
+`setup_linux.sh` installs `tesseract-ocr` (scanned PDFs) and `libreoffice-writer-nogui` (old `.doc`
+files), creates `./venv` from `requirements-agent.txt`, pulls `qwen2.5:7b`, and adds the `fin-agent`
+and `qcr` commands to `~/.local/bin` (open a new terminal if they are not found). Details:
+[Terminal Agent](#terminal-agent-for-finance-files) and
+[Quality Control Review](#quality-control-review-of-audit-files).
+
+The rest of this section describes the browser chat app with voice (`app.py`), which is optional on Linux.
+
 ## Repository Structure
 ```
 .
@@ -13,7 +35,8 @@ The assistant leverages local language models through Ollama, maintains conversa
 ├── qcr_checklist.csv      # Default QCR checklist (ISAs (UK)); replace with your firm's
 ├── offline script.py      # Utility for offline document processing and embedding
 ├── setup_linux.sh         # One-time setup script for Ubuntu/Debian
-├── requirements.txt       # Python dependencies
+├── requirements.txt       # Python dependencies for the web app (includes the terminal tools)
+├── requirements-agent.txt # Python dependencies for the terminal tools only
 ├── static/               # Static web assets
 │   └── style.css        # CSS styling for the chat interface
 ├── templates/           # HTML templates
@@ -58,11 +81,11 @@ cd Local-LLM
 curl -fsSL https://ollama.com/install.sh | sh
 
 # Install system packages, create ./venv, install Python packages and pull the models
-./setup_linux.sh
+./setup_linux.sh --with-web-app
 ```
 
 <details>
-<summary>Manual steps (what <code>setup_linux.sh</code> does)</summary>
+<summary>Manual steps (what <code>setup_linux.sh --with-web-app</code> does)</summary>
 
 ```bash
 sudo apt update
@@ -203,11 +226,12 @@ Clients/
 ├── Acme Widgets Ltd/      AuditFile_2025.zip, Financial statements.pdf, ...
 └── Bloggs & Co/           ...
 ```
+`qcr` is the command added by `setup_linux.sh`; it is the same as `python qcr.py` with the venv active
+(use that form on Windows).
 ```bash
-source venv/bin/activate
-python qcr.py ~/Clients/"Acme Widgets Ltd"          # one client
-python qcr.py ~/Clients --all                        # every client + a portfolio summary
-python qcr.py ~/Clients/"Acme Widgets Ltd" --items 8,29   # re-assess selected items only
+qcr ~/Clients/"Acme Widgets Ltd"                  # one client
+qcr ~/Clients --all                               # every client + a portfolio summary
+qcr ~/Clients/"Acme Widgets Ltd" --items 8,29     # re-assess selected items only
 ```
 
 **What it does for each client**
@@ -227,7 +251,7 @@ python qcr.py ~/Clients/"Acme Widgets Ltd" --items 8,29   # re-assess selected i
 
 Results are cached per item, so an interrupted review continues where it stopped and re-running is
 instant. To follow up on a finding, open the client in the interactive agent
-(`python agent.py ~/Clients/"Acme Widgets Ltd"`) and ask, for example, "show me the going concern
+(`cd ~/Clients/"Acme Widgets Ltd" && fin-agent`) and ask, for example, "show me the going concern
 work and the date the financial statements were approved".
 
 **The checklist** (`qcr_checklist.csv`) has 37 items covering acceptance and ethics, planning, execution,
@@ -261,10 +285,11 @@ The model can call tools to look at your files and run calculations, so it answe
 data instead of guessing. Nothing leaves your machine.
 
 ```bash
-ollama pull qwen2.5:7b                      # a model that supports tool calling (~4.7 GB)
-source venv/bin/activate                    # Windows: venv\Scripts\activate
-python agent.py ~/Documents/finance         # the folder with your statements, invoices, budgets
+cd ~/Documents/finance       # the folder with your statements, invoices, budgets
+fin-agent                    # Linux, after setup_linux.sh (or: fin-agent ~/Documents/finance)
 ```
+On Windows (or without the command): `venv\Scripts\activate` then `python agent.py C:\path\to\folder`.
+The default model `qwen2.5:7b` supports tool calling (~4.7 GB, pulled by `setup_linux.sh`).
 
 Then ask things like:
 - "Summarise my spending by category for January and flag duplicate charges"

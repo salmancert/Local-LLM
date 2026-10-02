@@ -1,13 +1,7 @@
+# Web app with voice (app.py); also installs the terminal tools
+-r requirements-agent.txt
 flask
 waitress
-requests
-PyMuPDF
 chromadb
 openai-whisper
 pyttsx3
-# terminal agent (agent.py)
-rich
-pandas
-openpyxl
-xlrd
-python-docx>=1.1
