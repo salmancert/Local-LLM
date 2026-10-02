@@ -1,7 +1,24 @@
+import os
 import requests
 
-def query_ollama(prompt, model="mistral"):
-    url = "http://localhost:11434/api/chat"
+# Override with environment variables, e.g. OLLAMA_MODEL=llama3.2:3b python app.py
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "mistral")
+EMBED_MODEL = "nomic-embed-text"  # must match the model used to build chroma_store
+
+def ollama_embed(text):
+    response = requests.post(f"{OLLAMA_URL}/api/embeddings", json={
+        "model": EMBED_MODEL,
+        "prompt": text
+    })
+    data = response.json()
+    if "embedding" not in data:
+        raise RuntimeError(f"Ollama embedding failed: {data.get('error', data)} "
+                           f"(did you run 'ollama pull {EMBED_MODEL}'?)")
+    return data["embedding"]
+
+def query_ollama(prompt, model=OLLAMA_MODEL):
+    url = f"{OLLAMA_URL}/api/chat"
     payload = {
         "model": model,
         "messages": [

@@ -1,38 +1,40 @@
 from flask import Flask, render_template, request, jsonify
-from utils.ollama_client import query_ollama
+from utils.ollama_client import query_ollama, ollama_embed
 from utils.web_search import search_web  # optional for online use
 from utils.doc_parser import parse_document
 import os
+import re
+import sys
 import uuid
+import shutil
+import getpass
 import datetime
-import requests
 from chromadb import PersistentClient
 import whisper
 import pyttsx3
 import threading
+import queue
+
+# Resolve paths from this file so the app works no matter which directory it is started from
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads/'
-app.config['AUDIO_FOLDER'] = 'audio/'
+app.config['UPLOAD_FOLDER'] = os.path.join(BASE_DIR, 'uploads')
+app.config['AUDIO_FOLDER'] = os.path.join(BASE_DIR, 'audio')
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['AUDIO_FOLDER'], exist_ok=True)
 
 # Initialize ChromaDB with persistent storage
-chroma_client = PersistentClient(path="chroma_store")
+chroma_client = PersistentClient(path=os.path.join(BASE_DIR, "chroma_store"))
 collection = chroma_client.get_or_create_collection("chat_memory")
 
-# Initialize Whisper model
-whisper_model = whisper.load_model("base")  # or "small", "medium", "large"
+# Initialize Whisper model ("tiny", "base", "small", "medium", "large"; bigger = more RAM)
+whisper_model = whisper.load_model(os.environ.get("WHISPER_MODEL", "base"))
 
-# Initialize offline TTS
-tts_engine = pyttsx3.init()
-
-def ollama_embed(text):
-    response = requests.post("http://localhost:11434/api/embeddings", json={
-        "model": "nomic-embed-text",
-        "prompt": text
-    })
-    return response.json()['embedding']
+# Whisper decodes audio with the ffmpeg command-line tool
+if shutil.which("ffmpeg") is None:
+    print("WARNING: ffmpeg not found on PATH, voice input will fail. "
+          "Install it (Ubuntu: sudo apt install ffmpeg, Windows: winget install ffmpeg).")
 
 def save_to_memory(role, text, session_id, response=None):
     embedding = ollama_embed(text)
@@ -59,32 +61,92 @@ def retrieve_context(query, top_k=5):
     results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
     return "\n".join(results["documents"][0]) if results["documents"] else ""
 
-def _speak(text):
+def _pick_voice(voices):
+    def is_english(voice):
+        langs = " ".join(str(lang) for lang in (getattr(voice, 'languages', None) or []))
+        return 'english' in voice.name.lower() or re.search(r"\ben(\b|_)", langs.lower()) is not None
+
+    # Select a natural-sounding female voice: Zira on Windows, any English "Female" voice elsewhere
+    for voice in voices:
+        if 'female' in voice.name.lower() or 'zira' in voice.name.lower():
+            return voice
+    for voice in voices:
+        if str(getattr(voice, 'gender', '')).lower() == 'female' and is_english(voice):
+            return voice
+    # eSpeak NG (Linux) lists every language and starts with Afrikaans, so pick English explicitly
+    english = [voice for voice in voices if is_english(voice)]
+    for voice in english:
+        if 'america' in voice.name.lower() or voice.id.lower().endswith('en-us'):
+            return voice
+    return english[0] if english else None  # None keeps the engine default
+
+def _init_tts():
+    # Offline TTS: SAPI5 on Windows, eSpeak NG on Linux. Set SERVER_TTS=0 to disable it.
+    if os.environ.get("SERVER_TTS", "1").lower() in ("0", "false", "no", "off"):
+        return None
     try:
-        # Select a natural-sounding female voice
-        voices = tts_engine.getProperty('voices')
-        for voice in voices:
-            if 'female' in voice.name.lower() or 'zira' in voice.name.lower():
-                tts_engine.setProperty('voice', voice.id)
-                break
-        else:
-            tts_engine.setProperty('voice', voices[0].id)  # fallback
+        engine = pyttsx3.init()
+    except Exception as e:
+        hint = " Install it with: sudo apt install espeak-ng" if sys.platform.startswith("linux") else ""
+        print(f"WARNING: offline TTS unavailable ({e}), the server will not speak responses.{hint}")
+        return None
 
-        tts_engine.setProperty('rate', 170)
-        tts_engine.setProperty('volume', 1.0)
+    try:
+        voice = _pick_voice(engine.getProperty('voices') or [])
+        if voice is not None:
+            voice_id = voice.id
+            # eSpeak NG voices are male; its "+f3" variant turns the chosen voice into a female one
+            if sys.platform.startswith("linux") and str(voice.gender).lower() != 'female':
+                voice_id += "+f3"
+            engine.setProperty('voice', voice_id)
+    except Exception as e:
+        print(f"TTS voice selection failed, using the default voice: {e}")
+    engine.setProperty('rate', 170)
+    engine.setProperty('volume', 1.0)
+    return engine
 
-        tts_engine.say(text)
-        tts_engine.runAndWait()
-    except RuntimeError as e:
-        print(f"TTS error: {e}")
+tts_engine = _init_tts()
+_tts_queue = queue.Queue()
+
+def _tts_worker():
+    # pyttsx3 is not thread-safe, so one worker thread speaks queued responses in order
+    while True:
+        text = _tts_queue.get()
+        try:
+            tts_engine.say(text)
+            tts_engine.runAndWait()
+        except Exception as e:
+            print(f"TTS error: {e}")
+
+if tts_engine is not None:
+    threading.Thread(target=_tts_worker, daemon=True).start()
 
 def speak_offline(text):
-    # Start a new thread to prevent blocking and loop issues
-    threading.Thread(target=_speak, args=(text,), daemon=True).start()
-    
+    # Queue the text so the request is not blocked while speaking
+    if tts_engine is not None:
+        _tts_queue.put(text)
+
+def save_upload(storage, folder):
+    # Never use the client's filename as a path (it could be "../.." or "C:\..."); keep only a
+    # plain extension, which the document parser needs to detect the file type
+    ext = os.path.splitext(storage.filename or "")[1].lower()
+    if not (ext[1:].isascii() and ext[1:].isalnum()):
+        ext = ""
+    filepath = os.path.join(folder, uuid.uuid4().hex + ext)
+    storage.save(filepath)
+    return filepath
+
 @app.route('/')
 def index():
     return render_template('chat.html')
+
+@app.route('/get_username')
+def get_username():
+    # getpass reads USERNAME on Windows and USER/LOGNAME on Linux
+    try:
+        return jsonify({"username": getpass.getuser()})
+    except Exception:
+        return jsonify({"username": None})
 
 @app.route('/chat', methods=['POST'])
 def chat():
@@ -112,17 +174,18 @@ def upload_doc():
     file = request.files['file']
     session_id = request.form.get("session_id", str(uuid.uuid4()))
 
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-    file.save(filepath)
+    filepath = save_upload(file, app.config['UPLOAD_FOLDER'])
+    try:
+        content = parse_document(filepath)
+    finally:
+        os.remove(filepath)
 
-    content = parse_document(filepath)
     chunk_size = 1000
     chunks = [content[i:i + chunk_size] for i in range(0, len(content), chunk_size)]
 
     for chunk in chunks:
         save_to_memory("document", chunk, session_id)
 
-    os.remove(filepath)
     return jsonify({"message": "Document uploaded and stored in memory successfully", "session_id": session_id})
 
 @app.route('/upload_audio', methods=['POST'])
@@ -130,13 +193,13 @@ def upload_audio():
     audio = request.files['audio']
     session_id = request.form.get("session_id", str(uuid.uuid4()))
 
-    filepath = os.path.join(app.config['AUDIO_FOLDER'], audio.filename)
-    audio.save(filepath)
-
-    result = whisper_model.transcribe(filepath)
+    filepath = save_upload(audio, app.config['AUDIO_FOLDER'])
+    try:
+        # fp16 only works on a CUDA GPU; on CPU this avoids Whisper's FP32 fallback warning
+        result = whisper_model.transcribe(filepath, fp16=whisper_model.device.type == "cuda")
+    finally:
+        os.remove(filepath)
     text = result['text']
-
-    os.remove(filepath)
 
     return jsonify({"message": "Audio transcribed successfully", "text": text, "session_id": session_id})
 

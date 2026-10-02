@@ -1,9 +1,7 @@
 flask
-fitz
+waitress
 requests
-frontend
-tools
+PyMuPDF
 chromadb
 openai-whisper
 pyttsx3
-waitress

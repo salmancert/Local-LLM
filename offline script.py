@@ -1,43 +1,44 @@
 import os
+import sys
 import uuid
 import datetime
-import requests
 from chromadb import PersistentClient
 from utils.doc_parser import parse_document
+from utils.ollama_client import ollama_embed  # same embedding function as the app
 
+# Usage (Linux):   python "offline script.py" ~/Documents/report.pdf [more files...]
+# Usage (Windows): python "offline script.py" C:\Users\you\Documents\report.pdf
+if len(sys.argv) < 2:
+    sys.exit('Usage: python "offline script.py" <document> [more documents...]')
 
-# ---- Define the embedding function (same as in your app) ----
-def ollama_embed(text):
-    response = requests.post("http://localhost:11434/api/embeddings", json={
-        "model": "nomic-embed-text",
-        "prompt": text
-    })
-    return response.json()['embedding']
-
-# ---- Initialize ChromaDB and Collection ----
-client = PersistentClient(path="chroma_store")
+# ---- Initialize ChromaDB and Collection (the same store app.py uses) ----
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+client = PersistentClient(path=os.path.join(BASE_DIR, "chroma_store"))
 collection = client.get_or_create_collection("chat_memory")
 
-# ---- Load and Chunk the Document ----
-file_path = "FILE LOCATION"  # or .docx, .txt, etc.
-text = parse_document(file_path)
-
 chunk_size = 3000
-chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
 
-# ---- Generate Embeddings ----
-embeddings = [ollama_embed(chunk) for chunk in chunks]
+for file_path in sys.argv[1:]:
+    # ---- Load and Chunk the Document ----
+    text = parse_document(os.path.expanduser(file_path))
+    chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+    if not chunks:
+        print(f"⚠️ No text found in {file_path}, skipping.")
+        continue
 
-# ---- Add to ChromaDB ----
-collection.add(
-    documents=chunks,
-    embeddings=embeddings,
-    ids=[str(uuid.uuid4()) for _ in chunks],
-    metadatas=[{
-        "role": "document",
-        "session_id": "offline",
-        "timestamp": datetime.datetime.now().isoformat()
-    } for _ in chunks]
-)
+    # ---- Generate Embeddings ----
+    embeddings = [ollama_embed(chunk) for chunk in chunks]
 
-print(f"✅ Finished embedding {len(chunks)} chunks into ChromaDB.")
+    # ---- Add to ChromaDB ----
+    collection.add(
+        documents=chunks,
+        embeddings=embeddings,
+        ids=[str(uuid.uuid4()) for _ in chunks],
+        metadatas=[{
+            "role": "document",
+            "session_id": "offline",
+            "timestamp": datetime.datetime.now().isoformat()
+        } for _ in chunks]
+    )
+
+    print(f"✅ Finished embedding {len(chunks)} chunks from {file_path} into ChromaDB.")
