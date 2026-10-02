@@ -9,6 +9,8 @@ The assistant leverages local language models through Ollama, maintains conversa
 .
 ├── app.py                 # Main Flask application with routing and core logic
 ├── agent.py               # Terminal agent with tool calling for finance files
+├── qcr.py                 # Quality control review of audit engagement files
+├── qcr_checklist.csv      # Default QCR checklist (ISAs (UK)); replace with your firm's
 ├── offline script.py      # Utility for offline document processing and embedding
 ├── setup_linux.sh         # One-time setup script for Ubuntu/Debian
 ├── requirements.txt       # Python dependencies
@@ -129,7 +131,8 @@ Optional environment variables:
 | `WHISPER_MODEL` | `base` | Speech recognition model: `tiny`, `base`, `small`, `medium`, `large` |
 | `SERVER_TTS` | `1` | Set to `0` to stop the server from speaking replies (the browser can still read them aloud) |
 | `AGENT_MODEL` | `qwen2.5:7b` | Tool-calling model used by `agent.py` |
-| `AGENT_CTX` | `16384` | Context size in tokens for `agent.py` |
+| `AGENT_CTX` | `16384` | Context size in tokens for `agent.py` and `qcr.py` |
+| `QCR_MODEL` | `AGENT_MODEL` | Model used by `qcr.py` |
 
 ```bash
 # Linux
@@ -189,6 +192,69 @@ curl -X POST -F "audio=@your_recording.wav" http://localhost:8000/upload_audio
 - Replies are spoken twice: the server and the browser both speak. Click the Mute button in the
   page, or start the app with `SERVER_TTS=0`
 
+## Quality Control Review of Audit Files
+`qcr.py` runs a quality control (cold file) review of an audit engagement file, in the style of an
+ICAEW QAD review, entirely on your machine. It is built for doing the same exercise for many clients:
+**no client data leaves the computer** (the model runs in Ollama locally, and nothing is uploaded).
+
+Put each client's audit file in its own folder (zip, Word, Excel and PDF files, as exported):
+```
+Clients/
+├── Acme Widgets Ltd/      AuditFile_2025.zip, Financial statements.pdf, ...
+└── Bloggs & Co/           ...
+```
+```bash
+source venv/bin/activate
+python qcr.py ~/Clients/"Acme Widgets Ltd"          # one client
+python qcr.py ~/Clients --all                        # every client + a portfolio summary
+python qcr.py ~/Clients/"Acme Widgets Ltd" --items 8,29   # re-assess selected items only
+```
+
+**What it does for each client**
+1. Unpacks zip files (including zips inside zips) into `_extracted/`, and reads Word (`.docx`, and `.doc`
+   via LibreOffice), Excel, PDF (scanned pages via Tesseract OCR) and text files. Files that cannot be read,
+   such as password-protected zips, are listed so you know what the review did not cover.
+2. For each checklist item, finds the most relevant passages in the file and asks the local model for a
+   status (Satisfactory / Finding / Not evidenced / Not applicable), severity, finding, quoted evidence and
+   recommendation. **Every quote is checked against the documents**; quotes the model made up are
+   marked `[UNVERIFIED]`.
+3. Writes to `<client>/_qcr/`:
+   - `QCR_<client>_<date>.xlsx`: Summary, Checklist (with blank *Reviewer conclusion* / *Reviewer
+     comments* columns for sign-off), Evidence (file and page of each quote) and Files reviewed
+   - `QCR_<client>_<date>.docx`: a draft review report with findings ordered by severity, items not
+     evidenced and unreadable files
+   - with `--all`, `QCR_portfolio_<date>.xlsx` in the parent folder: one row per client
+
+Results are cached per item, so an interrupted review continues where it stopped and re-running is
+instant. To follow up on a finding, open the client in the interactive agent
+(`python agent.py ~/Clients/"Acme Widgets Ltd"`) and ask, for example, "show me the going concern
+work and the date the financial statements were approved".
+
+**The checklist** (`qcr_checklist.csv`) has 37 items covering acceptance and ethics, planning, execution,
+completion and reporting, referenced to ISAs (UK), the FRC Ethical Standard and ISQM (UK). It is a
+starting point, not ICAEW's own checklist: replace or extend it with your firm's (`--checklist
+file.xlsx` or `.csv`). Only a `question` column is required; `id`, `area`, `reference` and
+`search_terms` (separated by `;`, used to find the right passages) are optional but improve results.
+
+**Limitations: this is a first-pass draft for a qualified reviewer, not a review.**
+- A 7B model running locally makes mistakes. Check every conclusion against the file.
+- "Not evidenced" means no relevant text was found, not that the work was not done (it may be in a
+  scanned page, an image or a file that could not be read).
+- The grade is an indicative rule of thumb (any high-severity finding = "Significant improvement
+  required"; not graded if over a quarter of items are not evidenced). You decide the grade.
+- Speed on a CPU-only machine: roughly a minute per checklist item, so 30-60 minutes per client.
+  Run `--all` overnight for a batch. `QCR_MODEL` (default `qwen2.5:7b`) selects the model; a larger
+  model such as `qwen2.5:14b` (~9 GB RAM) gives better judgements if your machine can spare the memory.
+
+**Extra software:** `sudo apt install tesseract-ocr libreoffice-writer-nogui` (included in
+`setup_linux.sh`). On Windows install [Tesseract](https://github.com/UB-Mannheim/tesseract/wiki) and
+LibreOffice and make sure both are on the `PATH`.
+
+**Confidentiality notes:** keep client folders outside this repository (the `.gitignore` also excludes
+`clients/`, `_qcr/` and `_extracted/` as a safeguard). The tools warn if `OLLAMA_URL` points to another
+machine. Unpacked copies in `_extracted/` and outputs in `_qcr/` live inside each client folder, so
+they are covered by the same retention and deletion policy as the client file.
+
 ## Terminal Agent for Finance Files
 `agent.py` is a Claude Code style assistant that runs in your terminal on a local Ollama model.
 The model can call tools to look at your files and run calculations, so it answers from your actual
@@ -210,7 +276,7 @@ Then ask things like:
 | Tool | What it does | Asks first? |
 |------|--------------|-------------|
 | `list_files` | List files with size and date | no |
-| `read_file` | Read text, CSV, PDF and Excel files as numbered lines | no |
+| `read_file` | Read text, CSV, PDF, Word and Excel files as numbered lines (zips are unpacked first) | no |
 | `inspect_table` | Columns, types, first rows and numeric summary of a CSV/Excel file | no |
 | `search_files` | Regex search across files, including PDFs and spreadsheets | no |
 | `run_python` | Run Python with pandas for calculations (totals, grouping, reconciliation) | yes |
@@ -222,7 +288,8 @@ File tools are limited to the folder you start the agent in. Before `run_python`
 this session), or your own instruction instead. Start with `--yes` to skip the questions.
 
 **Commands:** `/help`, `/clear` (new conversation), `/model <name>`, `/auto` (toggle asking),
-`/tools`, `/exit`. End a line with `\` to continue typing on the next line; Ctrl+C stops an answer.
+`/tools`, `/extract` (unpack newly added zips), `/save` (save the conversation to `_agent_logs/` as an
+audit trail), `/exit`. End a line with `\` to continue typing on the next line; Ctrl+C stops an answer.
 Use `python agent.py -p "question"` for a single answer without the interactive prompt.
 
 **Models:** any Ollama model with tool support works, set with `--model` or `AGENT_MODEL`.

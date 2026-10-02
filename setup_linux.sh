@@ -4,9 +4,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "==> Installing system packages (needs sudo)"
-# ffmpeg: audio decoding for Whisper, espeak-ng + alsa-utils: offline TTS used by pyttsx3
+# ffmpeg: audio decoding for Whisper, espeak-ng + alsa-utils: offline TTS used by pyttsx3,
+# tesseract-ocr: reads scanned PDFs, libreoffice-writer-nogui: reads old .doc files
 sudo apt-get update
-sudo apt-get install -y python3 python3-venv ffmpeg espeak-ng alsa-utils curl
+sudo apt-get install -y python3 python3-venv ffmpeg espeak-ng alsa-utils curl \
+    tesseract-ocr libreoffice-writer-nogui
 
 echo "==> Creating virtual environment in ./venv"
 python3 -m venv venv
@@ -50,3 +52,5 @@ echo "    source venv/bin/activate && python app.py"
 echo "then open http://localhost:8000"
 echo "or the terminal agent with:"
 echo "    source venv/bin/activate && python agent.py ~/path/to/finance-files"
+echo "or a quality control review of a client's audit file with:"
+echo "    source venv/bin/activate && python qcr.py ~/path/to/Clients/ClientName"

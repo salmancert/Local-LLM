@@ -9,3 +9,5 @@ pyttsx3
 rich
 pandas
 openpyxl
+xlrd
+python-docx>=1.1

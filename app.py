@@ -10,6 +10,7 @@ import shutil
 import getpass
 import datetime
 from chromadb import PersistentClient
+from chromadb.config import Settings
 import whisper
 import pyttsx3
 import threading
@@ -25,7 +26,8 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['AUDIO_FOLDER'], exist_ok=True)
 
 # Initialize ChromaDB with persistent storage
-chroma_client = PersistentClient(path=os.path.join(BASE_DIR, "chroma_store"))
+chroma_client = PersistentClient(path=os.path.join(BASE_DIR, "chroma_store"),
+                                 settings=Settings(anonymized_telemetry=False))
 collection = chroma_client.get_or_create_collection("chat_memory")
 
 # Initialize Whisper model ("tiny", "base", "small", "medium", "large"; bigger = more RAM)

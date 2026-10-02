@@ -3,6 +3,7 @@ import sys
 import uuid
 import datetime
 from chromadb import PersistentClient
+from chromadb.config import Settings
 from utils.doc_parser import parse_document
 from utils.ollama_client import ollama_embed  # same embedding function as the app
 
@@ -13,7 +14,8 @@ if len(sys.argv) < 2:
 
 # ---- Initialize ChromaDB and Collection (the same store app.py uses) ----
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-client = PersistentClient(path=os.path.join(BASE_DIR, "chroma_store"))
+client = PersistentClient(path=os.path.join(BASE_DIR, "chroma_store"),
+                          settings=Settings(anonymized_telemetry=False))
 collection = client.get_or_create_collection("chat_memory")
 
 chunk_size = 3000

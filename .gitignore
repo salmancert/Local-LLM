@@ -4,3 +4,9 @@ venv/
 .venv/
 uploads/
 audio/
+# client data and review outputs must never be committed
+clients/
+_extracted/
+_qcr/
+_agent_logs/
+QCR_portfolio_*.xlsx

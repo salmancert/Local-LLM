@@ -11,13 +11,16 @@ import argparse
 import datetime
 import difflib
 import fnmatch
+import hashlib
 import json
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 
 import requests
 from rich.console import Console
@@ -43,8 +46,11 @@ AGENT_CTX = int(os.environ.get("AGENT_CTX", "16384"))
 MAX_STEPS = 20            # tool calls per user message before the agent must stop
 MAX_TOOL_OUTPUT = 12000   # characters of tool output sent back to the model
 COMMAND_TIMEOUT = 300     # seconds for run_python / run_shell
-SKIP_DIRS = {".git", "venv", ".venv", "__pycache__", "node_modules", "chroma_store"}
-TABLE_EXTS = {".csv", ".tsv", ".xlsx", ".xlsm", ".xls", ".ods"}
+SKIP_DIRS = {".git", "venv", ".venv", "__pycache__", "node_modules", "chroma_store", "__MACOSX"}
+EXCEL_EXTS = {".xlsx", ".xlsm", ".xls", ".ods"}
+EXTRACT_DIR = "_extracted"             # zip archives are unpacked here inside the workspace
+MAX_EXTRACT_BYTES = 5 * 1024 ** 3      # refuse archives that would unpack to more than 5 GB
+CONVERTED_DIR = os.path.join(tempfile.gettempdir(), "agent-converted")  # set to the workspace in main()
 
 console = Console()
 
@@ -80,6 +86,8 @@ class Workspace:
         for dirpath, dirnames, filenames in os.walk(base):
             dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS and not d.startswith("."))
             for name in sorted(filenames):
+                if name.startswith((".", "~$")):  # hidden files and Office lock files
+                    continue
                 full = os.path.join(dirpath, name)
                 if fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(self.rel(full), pattern):
                     yield full
@@ -88,7 +96,7 @@ class Workspace:
 def load_table(full, sheet=None):
     import pandas as pd
     ext = os.path.splitext(full)[1].lower()
-    if ext in (".xlsx", ".xlsm", ".xls", ".ods"):
+    if ext in EXCEL_EXTS:
         sheets = pd.ExcelFile(full).sheet_names
         df = pd.read_excel(full, sheet_name=sheet if sheet is not None else sheets[0])
         return df, sheets
@@ -96,29 +104,170 @@ def load_table(full, sheet=None):
     return pd.read_csv(full, sep=None, engine="python"), None
 
 
+_text_cache = {}
+
+
 def file_text(full):
-    """Return the text of a file as lines, converting PDFs and spreadsheets."""
+    """Return the text of a file as lines, converting PDF, Word and Excel files."""
+    key = (full, os.path.getmtime(full), os.path.getsize(full))
+    if key not in _text_cache:
+        _text_cache[key] = _file_text(full)
+    return _text_cache[key]
+
+
+def _file_text(full):
     ext = os.path.splitext(full)[1].lower()
     if ext == ".pdf":
-        from utils.doc_parser import fitz
-        lines = []
-        with fitz.open(full) as doc:
-            for number, page in enumerate(doc, 1):
-                lines.append(f"----- page {number} -----")
-                lines.extend(page.get_text().splitlines())
-        return lines
-    if ext in (".xlsx", ".xlsm", ".xls", ".ods"):
+        return pdf_lines(full)
+    if ext in (".docx", ".docm"):
+        return docx_lines(full)
+    if ext in (".doc", ".rtf", ".odt"):
+        return docx_lines(convert_to_docx(full))
+    if ext in EXCEL_EXTS:
         import pandas as pd
         lines = []
         for name, df in pd.read_excel(full, sheet_name=None).items():
             lines.append(f"----- sheet {name} -----")
             lines.extend(df.to_csv(index=False).splitlines())
         return lines
+    if ext == ".zip":
+        raise ToolError(f"{os.path.basename(full)} is a zip archive; its contents are in {EXTRACT_DIR}/")
     with open(full, "rb") as f:
         data = f.read()
     if b"\0" in data[:4096]:
         raise ToolError(f"{os.path.basename(full)} is a binary file and cannot be read as text")
     return data.decode("utf-8", errors="replace").splitlines()
+
+
+def pdf_lines(full):
+    from utils.doc_parser import fitz
+    lines = []
+    with fitz.open(full) as doc:
+        if doc.needs_pass:
+            raise ToolError(f"{os.path.basename(full)} is password protected")
+        for number, page in enumerate(doc, 1):
+            lines.append(f"----- page {number} -----")
+            text = page.get_text()
+            if not text.strip() and page.get_images():
+                text = ocr_page(page)
+            lines.extend(text.splitlines())
+    return lines
+
+
+def ocr_page(page):
+    """Scanned pages have no text layer; read them with Tesseract OCR when it is installed."""
+    if shutil.which("tesseract") is None:
+        return "[scanned page without text; install tesseract-ocr to read it]"
+    try:
+        return "[OCR] " + page.get_textpage_ocr(full=True, dpi=300).extractText()
+    except Exception as e:
+        return f"[scanned page, OCR failed: {e}]"
+
+
+def docx_lines(full):
+    import docx
+    from docx.table import Table
+    document = docx.Document(full)
+    lines = []
+    for block in document.iter_inner_content():  # paragraphs and tables in document order
+        if isinstance(block, Table):
+            lines.append("[table]")
+            for row in block.rows:
+                cells = []
+                for cell in row.cells:
+                    text = " ".join(cell.text.split())
+                    if not cells or cells[-1] != text:  # merged cells repeat their text
+                        cells.append(text)
+                lines.append(" | ".join(cells))
+            lines.append("[/table]")
+        elif block.text.strip():
+            style = block.style.name if block.style is not None else ""
+            prefix = "#" * int(style[-1]) + " " if re.fullmatch(r"Heading [1-6]", style) else ""
+            lines.append(prefix + block.text)
+    return lines
+
+
+def convert_to_docx(full):
+    """Convert legacy Word (.doc) and other formats with LibreOffice. Converted copies are cached inside
+    the workspace (not the shared temp folder) so client data stays in the client's folder."""
+    office = shutil.which("soffice") or shutil.which("libreoffice")
+    if office is None:
+        raise ToolError(f"reading {os.path.basename(full)} needs LibreOffice "
+                        "(Ubuntu: sudo apt install libreoffice-writer), or save it as .docx")
+    stamp = hashlib.sha1(f"{full}:{os.path.getmtime(full)}".encode()).hexdigest()[:16]
+    target = os.path.join(CONVERTED_DIR, stamp, os.path.splitext(os.path.basename(full))[0] + ".docx")
+    if not os.path.exists(target):
+        subprocess.run([office, "--headless", "--convert-to", "docx", "--outdir", os.path.dirname(target), full],
+                       capture_output=True, timeout=180)
+        if not os.path.exists(target):
+            raise ToolError(f"LibreOffice could not convert {os.path.basename(full)}")
+    return target
+
+
+def extract_archives(ws):
+    """Unpack every .zip in the workspace (and zips inside them) into _extracted/ so the tools can read
+    the contents. Archives that were already unpacked and have not changed are skipped."""
+    messages = []
+    for _ in range(5):  # levels of zips inside zips
+        found_new = False
+        for full in list(ws.walk(".", "*.zip")):
+            rel = ws.rel(full)
+            if rel.split(os.sep)[0] == EXTRACT_DIR:
+                target = os.path.splitext(full)[0]  # nested zip: unpack next to it
+            else:
+                target = os.path.join(ws.root, EXTRACT_DIR, os.path.splitext(rel)[0])
+            stamp = f"{os.path.getsize(full)}:{os.path.getmtime(full)}"
+            marker = os.path.join(target, ".extracted_from_zip")
+            if os.path.exists(marker) and open(marker).read().split("\n")[0] == stamp:
+                continue
+            found_new = True
+            try:
+                count = unzip(full, target)
+                with open(marker, "w") as f:
+                    f.write(stamp)
+                messages.append(f"unpacked {rel} ({count} files) into {ws.rel(target)}")
+            except (zipfile.BadZipFile, RuntimeError, ToolError, OSError) as e:
+                os.makedirs(target, exist_ok=True)
+                with open(marker, "w") as f:  # don't retry a broken archive on every start
+                    f.write(f"{stamp}\nerror: {e}")
+                messages.append(f"could not unpack {rel}: {e}")
+        if not found_new:
+            break
+    return messages
+
+
+def archive_status(ws, full):
+    """'unpacked', or the reason the archive could not be unpacked."""
+    rel = ws.rel(full)
+    if rel.split(os.sep)[0] == EXTRACT_DIR:
+        target = os.path.splitext(full)[0]
+    else:
+        target = os.path.join(ws.root, EXTRACT_DIR, os.path.splitext(rel)[0])
+    try:
+        with open(os.path.join(target, ".extracted_from_zip")) as f:
+            lines = f.read().split("\n")
+    except OSError:
+        return "not unpacked"
+    return lines[1] if len(lines) > 1 else f"unpacked into {ws.rel(target)}"
+
+
+def unzip(full, target):
+    with zipfile.ZipFile(full) as archive:
+        members = [m for m in archive.infolist() if not m.is_dir()]
+        if any(m.flag_bits & 0x1 for m in members):
+            raise ToolError("the archive is password protected, unzip it manually")
+        if sum(m.file_size for m in members) > MAX_EXTRACT_BYTES:
+            raise ToolError("the archive would unpack to more than 5 GB")
+        root = os.path.realpath(target)
+        os.makedirs(root, exist_ok=True)
+        for member in members:
+            dest = os.path.realpath(os.path.join(root, member.filename))
+            if os.path.commonpath([dest, root]) != root:
+                continue  # skip entries like ../../x that would escape the folder
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with archive.open(member) as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out)
+        return len(members)
 
 
 def tool_list_files(ws, path=".", pattern="*"):
@@ -236,7 +385,8 @@ TOOL_SCHEMAS = [
     _fn("list_files", "List files (size in bytes, modified date, path) under a directory of the workspace.",
         {"path": {"type": "string", "description": "Directory relative to the workspace, default '.'"},
          "pattern": {"type": "string", "description": "Glob such as '*.csv' or '2024/*', default '*'"}}, []),
-    _fn("read_file", "Read a text, CSV, PDF or Excel file as numbered lines. PDFs and sheets are converted to text.",
+    _fn("read_file", "Read a text, CSV, PDF, Word or Excel file as numbered lines (converted to text). "
+        "Word tables are shown as rows of cells separated by |.",
         {"path": {"type": "string"},
          "offset": {"type": "integer", "description": "First line to read, default 1"},
          "limit": {"type": "integer", "description": "Number of lines, default 200"}}, ["path"]),
@@ -244,7 +394,7 @@ TOOL_SCHEMAS = [
         "numeric summary. Use this before analysing a table.",
         {"path": {"type": "string"},
          "sheet": {"type": "string", "description": "Excel sheet name, default the first sheet"}}, ["path"]),
-    _fn("search_files", "Case-insensitive regex search through file contents (including PDFs and spreadsheets).",
+    _fn("search_files", "Case-insensitive regex search through file contents (including PDF, Word and Excel).",
         {"pattern": {"type": "string", "description": "Regular expression"},
          "path": {"type": "string", "description": "File or directory, default '.'"},
          "file_pattern": {"type": "string", "description": "Glob to filter files, e.g. '*.csv'"}}, ["pattern"]),
@@ -277,6 +427,8 @@ user's local files (bank statements, invoices, budgets, ledgers, spreadsheets, P
 
 Workspace: {root}
 Today: {today}. Operating system: {os}.
+Zip archives are already unpacked into {extract_dir}/<archive name>/; read the files there.
+_qcr/ holds quality control review outputs produced by qcr.py; they are not audit evidence.
 Files in the workspace:
 {files}
 
@@ -304,7 +456,7 @@ class Agent:
         if len(listing) > 60:
             listing = listing[:60] + [f"... and {len(listing) - 60} more (use list_files)"]
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT.format(
-            root=self.ws.root, today=datetime.date.today().isoformat(),
+            root=self.ws.root, today=datetime.date.today().isoformat(), extract_dir=EXTRACT_DIR,
             os=f"{platform.system()} {platform.release()}", files="\n".join(listing))}]
         self.tokens = 0
 
@@ -484,8 +636,32 @@ HELP = """[bold]Commands[/]
   /model [name]   show or switch the Ollama model
   /auto           toggle asking before run_python / run_shell / write_file
   /tools          list the tools the model can use
+  /extract        unpack zip files added since the agent started
+  /save           save this conversation (with tool calls) to _agent_logs/ as an audit trail
   /exit           quit (or Ctrl+D)
 End a line with \\ to keep typing on the next line. Ctrl+C stops a running answer."""
+
+
+def save_transcript(agent):
+    folder = os.path.join(agent.ws.root, "_agent_logs")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S") + ".md")
+    out = [f"# Agent session, {agent.ws.root}", f"Model: {agent.model}", ""]
+    for m in agent.messages[1:]:
+        if m["role"] == "user":
+            out += ["## User", m["content"], ""]
+        elif m["role"] == "assistant":
+            if m.get("content"):
+                out += ["## Assistant", m["content"], ""]
+            for call in m.get("tool_calls", []):
+                f = call.get("function", {})
+                out += [f"### Tool call: {f.get('name')}", "```json",
+                        json.dumps(f.get("arguments"), indent=2, ensure_ascii=False), "```", ""]
+        elif m["role"] == "tool":
+            out += [f"### Result: {m.get('tool_name')}", "```", m["content"], "```", ""]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out))
+    return agent.ws.rel(path)
 
 
 def check_model(model):
@@ -522,14 +698,25 @@ def main():
     parser.add_argument("--model", default=AGENT_MODEL, help=f"Ollama model (default: {AGENT_MODEL})")
     parser.add_argument("--yes", action="store_true", help="run code and write files without asking")
     parser.add_argument("-p", "--prompt", help="answer one prompt and exit")
+    parser.add_argument("--no-extract", action="store_true", help="don't unpack zip files into _extracted/")
     opts = parser.parse_args()
 
     root = os.path.expanduser(opts.directory)
     if not os.path.isdir(root):
         sys.exit(f"Not a directory: {opts.directory}")
     ws = Workspace(root)
+    global CONVERTED_DIR
+    CONVERTED_DIR = os.path.join(ws.root, EXTRACT_DIR, ".converted")
+    host = re.sub(r"^\w+://|[:/].*$", "", OLLAMA_URL)
+    if host not in ("localhost", "127.0.0.1", "::1", "[::1]"):
+        console.print(f"[bold yellow]Note: OLLAMA_URL points to {host}, so file contents are sent to that "
+                      "machine, not processed on this one.[/]")
     if not check_model(opts.model):
         sys.exit(1)
+    if not opts.no_extract:
+        with console.status("[dim]unpacking zip files…[/]"):
+            for line in extract_archives(ws):
+                console.print(f"[dim]{escape(line)}[/]")
     agent = Agent(ws, opts.model, auto_approve=opts.yes)
 
     def ask(text):
@@ -579,6 +766,13 @@ def main():
                 agent.approved = set() if agent.approved == NEEDS_APPROVAL else set(NEEDS_APPROVAL)
                 state = "on (no confirmation)" if agent.approved == NEEDS_APPROVAL else "off (ask first)"
                 console.print(f"Auto-approve: {state}")
+            elif command == "/extract":
+                for line in extract_archives(ws) or ["no new zip files"]:
+                    console.print(f"[dim]{escape(line)}[/]")
+                agent.reset()
+                console.print("[dim]Conversation restarted with the updated file list.[/]")
+            elif command == "/save":
+                console.print(f"Saved the conversation to [cyan]{save_transcript(agent)}[/]")
             elif command == "/tools":
                 for schema in TOOL_SCHEMAS:
                     f = schema["function"]
